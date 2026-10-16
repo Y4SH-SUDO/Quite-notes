@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/quiet-notes/"
+title = "Quiet Notes"
+description = "A minimalist personal notes app for writing notes, tasks, journal entries, and checklists across phones, tablets, and desktop computers. Notes and preferences are saved locally on the device."
+version = "1.0.0"
+id = "artifacts/quiet-notes"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/quiet-notes/" ]
+localPort = 21912
+
+[services.development]
+run = "pnpm --filter @workspace/quiet-notes run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/quiet-notes", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/quiet-notes/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "21912"
+BASE_PATH = "/quiet-notes/"
