@@ -351,6 +351,9 @@ function NoteEditor(props: {
   const [editorFocused, setEditorFocused] = useState(false);
   const [imageOptions, setImageOptions] = useState<ImageOptions>(defaultImageOptions);
   const [moreOpen, setMoreOpen] = useState(false);
+  const writingFontFamily = props.settings.fontFamily === 'Georgia'
+    ? 'Georgia, serif'
+    : "'Literata', Georgia, serif";
 
   const selectImage = (figure: HTMLElement | null) => {
     selectedImageRef.current = figure;
@@ -439,7 +442,7 @@ function NoteEditor(props: {
     const figure = selectedImageRef.current;
     if (!figure) return;
     const next = { ...imageOptions, ...partial };
-    if (next.size !== 'small') next.wrap = false;
+    if (next.size !== 'small' || next.alignment === 'center') next.wrap = false;
     figure.dataset.size = next.size;
     figure.dataset.align = next.alignment;
     figure.dataset.wrap = String(next.wrap);
@@ -579,6 +582,7 @@ function NoteEditor(props: {
           placeholder="Untitled"
           aria-label="Page title"
           className="mb-7 w-full border-0 bg-transparent p-0 font-[var(--app-font-serif)] text-[clamp(2rem,6vw,3.1rem)] font-normal leading-[1.15] tracking-[-.035em] text-[#e3ddd2] outline-none placeholder:text-[#4a4741]"
+          style={{ fontFamily: writingFontFamily }}
           data-testid="input-note-title"
         />
         <div ref={toolbarRef} className="relative mb-5 flex min-h-9 flex-wrap items-center gap-1">
@@ -603,7 +607,7 @@ function NoteEditor(props: {
                   <button onMouseDown={event => event.preventDefault()} onClick={() => updateSelectedImage({ alignment: 'center' })} className={`control-focus grid h-8 w-8 place-items-center rounded-md ${imageOptions.alignment === 'center' ? 'bg-[#25231e] text-[#e1d7c4]' : 'text-[#9a958a]'}`} aria-label="Align image center" aria-pressed={imageOptions.alignment === 'center'} data-testid="button-image-align-center"><AlignCenter size={15} /></button>
                   <button onMouseDown={event => event.preventDefault()} onClick={() => updateSelectedImage({ alignment: 'right' })} className={`control-focus grid h-8 w-8 place-items-center rounded-md ${imageOptions.alignment === 'right' ? 'bg-[#25231e] text-[#e1d7c4]' : 'text-[#9a958a]'}`} aria-label="Align image right" aria-pressed={imageOptions.alignment === 'right'} data-testid="button-image-align-right"><AlignRight size={15} /></button>
                 </div>
-                <button onMouseDown={event => event.preventDefault()} onClick={() => updateSelectedImage({ wrap: !imageOptions.wrap })} disabled={imageOptions.size !== 'small'} className="control-focus rounded-md px-2.5 py-1.5 text-xs text-[#aaa398] hover:bg-[#25231e] disabled:cursor-not-allowed disabled:opacity-40" aria-pressed={imageOptions.wrap} data-testid="button-image-wrap">Wrap text</button>
+                <button onMouseDown={event => event.preventDefault()} onClick={() => updateSelectedImage({ wrap: !imageOptions.wrap })} disabled={imageOptions.size !== 'small' || imageOptions.alignment === 'center'} className="control-focus rounded-md px-2.5 py-1.5 text-xs text-[#aaa398] hover:bg-[#25231e] disabled:cursor-not-allowed disabled:opacity-40" aria-pressed={imageOptions.wrap} data-testid="button-image-wrap">Wrap text</button>
                 <input value={imageOptions.caption} onChange={event => updateSelectedImage({ caption: event.target.value })} placeholder="Caption" aria-label="Image caption" className="control-focus min-w-[90px] flex-1 rounded-md border border-[#302e29] bg-transparent px-2.5 py-1.5 text-xs text-[#c8c1b6] placeholder:text-[#615d55]" data-testid="input-image-caption" />
                 <button onMouseDown={event => event.preventDefault()} onClick={removeSelectedImage} className="control-focus rounded-md px-2.5 py-1.5 text-xs text-[#c39a8a] hover:bg-[#251a17]" data-testid="button-remove-image">Remove</button>
               </div>}
@@ -612,14 +616,14 @@ function NoteEditor(props: {
         </div>
         <div
           ref={bodyRef}
-          className="note-body min-h-[42vh] font-[var(--editor-font)] text-[#cfc9bf] caret-[#d1bd98] selection:bg-[#594d37]"
+          className="note-body min-h-[18vh] font-[var(--editor-font)] text-[#cfc9bf] caret-[#d1bd98] selection:bg-[#594d37]"
           contentEditable
           suppressContentEditableWarning
           role="textbox"
           aria-label="Write your page"
           aria-multiline="true"
           data-placeholder={props.note.kind === 'journal' ? 'Begin with what stayed with you…' : props.note.kind === 'task' ? 'What needs doing?' : props.note.kind === 'checklist' ? 'Add a thought, then make a list…' : 'Begin anywhere…'}
-          style={{ fontFamily: props.settings.fontFamily === 'Georgia' ? 'Georgia, serif' : "'Literata', Georgia, serif", fontSize: `${props.settings.fontSize}px`, lineHeight: props.settings.lineSpacing }}
+          style={{ fontFamily: writingFontFamily, fontSize: `${props.settings.fontSize}px`, lineHeight: props.settings.lineSpacing }}
           onInput={handleBody}
           onFocus={() => setEditorFocused(true)}
           onBlur={event => {
@@ -642,14 +646,6 @@ function NoteEditor(props: {
               setEditorFocused(true);
             } else if (target instanceof HTMLElement && !target.closest('[data-note-image]')) {
               selectImage(null);
-            }
-          }}
-          onChange={event => {
-            const target = event.target;
-            if (target instanceof HTMLInputElement && target.type === 'checkbox') {
-              if (target.checked) target.setAttribute('checked', '');
-              else target.removeAttribute('checked');
-              handleBody();
             }
           }}
           onKeyDown={event => {
