@@ -93,11 +93,15 @@ export const defaultSettings: QuietSettings = {
 
 export function newNote(kind: NoteKind): QuietNote {
   const now = Date.now();
+  const checkId = kind === 'task' || kind === 'checklist' ? crypto.randomUUID() : null;
+  const content = checkId
+    ? `<div data-check-item="" data-check-id="${checkId}"><input type="checkbox" aria-label="Mark checklist item complete" data-testid="checkbox-check-item-${checkId}"><span data-check-text="" contenteditable="true"><br></span></div>`
+    : '';
   return {
     id: crypto.randomUUID(),
     title: '',
     kind,
-    content: '',
+    content,
     createdAt: now,
     updatedAt: now,
     recentlyOpenedAt: now,

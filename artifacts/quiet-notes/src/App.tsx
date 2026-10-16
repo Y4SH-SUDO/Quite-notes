@@ -6,14 +6,20 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
 import { Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
 import {
-  ArrowLeft, Bold, Check, Clock3, FileText, ImagePlus, Italic,
-  ListChecks, ListTodo, MoreHorizontal, Plus, Search, Settings, Trash2, Underline,
+  AlignCenter, AlignLeft, AlignRight, ArrowLeft, Bold, Check, Clock3, FileText,
+  ImagePlus, Italic, ListChecks, ListTodo, MoreHorizontal, Plus, Search, Settings,
+  Trash2, Underline,
   X,
 } from 'lucide-react';
 import {
   defaultSettings, newNote, quietStorage,
   type NoteKind, type QuietNote, type QuietSettings,
 } from './quiet-storage';
+import {
+  createChecklistItem, createImageFigure, defaultImageOptions, insertImageFigure,
+  migrateLegacyChecklistItems, migrateLegacyImages, placeCaretAtStart,
+  type ImageOptions, type ImageSize,
+} from './lib/editor-dom';
 
 const queryClient = new QueryClient();
 const kindNames: Record<NoteKind, string> = {
@@ -46,6 +52,7 @@ function AppSurface() {
   const [activeNote, setActiveNote] = useState<QuietNote | null>(null);
   const [search, setSearch] = useState('');
   const [kindMenu, setKindMenu] = useState(false);
+  const [editorSettingsOpen, setEditorSettingsOpen] = useState(false);
   const [storeError, setStoreError] = useState('');
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [saveState, setSaveState] = useState<'saved' | 'saving' | 'error'>('saved');
@@ -76,6 +83,7 @@ function AppSurface() {
 
   const openNote = useCallback(async (note: QuietNote) => {
     const opened = { ...note, recentlyOpenedAt: Date.now() };
+    setEditorSettingsOpen(false);
     updateNoteMemory(opened);
     setScreen('editor');
     setSaveState('saving');
@@ -91,6 +99,7 @@ function AppSurface() {
 
   const createNote = useCallback(async (kind: NoteKind) => {
     const created = newNote(kind);
+    setEditorSettingsOpen(false);
     updateNoteMemory(created);
     setScreen('editor');
     setKindMenu(false);
@@ -184,10 +193,23 @@ function AppSurface() {
           saveState={saveState}
           saveMessage={saveMessage}
           onSave={updated => void persistNote(updated)}
-          onBack={() => { setScreen('home'); setKindMenu(false); }}
+          onBack={() => { setEditorSettingsOpen(false); setScreen('home'); setKindMenu(false); }}
           onDelete={() => void deleteNote(activeNote)}
           onSaveMessage={setSaveMessage}
+          onSettings={() => setEditorSettingsOpen(true)}
         />
+      )}
+
+      {screen === 'editor' && editorSettingsOpen && (
+        <div className="fixed inset-0 z-40 flex items-end justify-end bg-black/45 backdrop-blur-[1px] sm:items-stretch" data-testid="panel-editor-settings">
+          <div className="h-[68dvh] w-full max-w-[560px] overflow-y-auto rounded-t-2xl border border-[#292723] bg-black shadow-2xl sm:h-full sm:rounded-none sm:border-y-0 sm:border-r-0 sm:border-l">
+            <SettingsScreen
+              settings={settings}
+              onChange={value => void savePreferences(value)}
+              onBack={() => setEditorSettingsOpen(false)}
+            />
+          </div>
+        </div>
       )}
 
       {screen === 'settings' && (
@@ -232,7 +254,7 @@ function HomeScreen(props: {
             <p className="mb-0 mt-3 font-[var(--app-font-serif)] text-base text-[#69655f]">Come back to what matters.</p>
           </div>
           <div className="relative shrink-0">
-            <button onClick={props.onCreate} aria-label="Create a page" className="control-focus grid h-[50px] w-[50px] place-items-center rounded-full border border-[#4a443a] bg-[#c9b999] text-[#171511] transition hover:bg-[#ddcdb0]" data-testid="button-create-note">
+            <button onClick={props.onCreate} aria-label="Create a page" className="control-focus grid h-[50px] w-[50px] place-items-center rounded-full border border-[#4a443a] bg-[#c9b999] text-[#171511] transition hover:bg-[#ddcdb0]" data-testid="button-open-create-menu">
               {props.kindMenu ? <X size={19} /> : <Plus size={22} strokeWidth={1.7} />}
             </button>
             {props.kindMenu && (
@@ -312,36 +334,76 @@ function NoteEditor(props: {
   onBack: () => void;
   onDelete: () => void;
   onSaveMessage: (message: string) => void;
+  onSettings: () => void;
 }) {
   const titleRef = useRef<HTMLInputElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const toolbarRef = useRef<HTMLDivElement>(null);
   const rangeRef = useRef<Range | null>(null);
-  const selectedImageRef = useRef<HTMLImageElement | null>(null);
+  const selectedImageRef = useRef<HTMLElement | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestNoteRef = useRef(props.note);
   const [title, setTitle] = useState(props.note.title);
   const [body, setBody] = useState(props.note.content);
   const [hasSelection, setHasSelection] = useState(false);
   const [imageSelected, setImageSelected] = useState(false);
+  const [editorFocused, setEditorFocused] = useState(false);
+  const [imageOptions, setImageOptions] = useState<ImageOptions>(defaultImageOptions);
   const [moreOpen, setMoreOpen] = useState(false);
 
-  useEffect(() => { if (bodyRef.current) bodyRef.current.innerHTML = props.note.content; }, [props.note.id]);
+  const selectImage = (figure: HTMLElement | null) => {
+    selectedImageRef.current = figure;
+    setImageSelected(Boolean(figure));
+    if (!figure) return;
+    const size = figure.dataset.size;
+    const alignment = figure.dataset.align;
+    setImageOptions({
+      size: size === 'small' || size === 'medium' ? size : 'full',
+      alignment: alignment === 'left' || alignment === 'right' ? alignment : 'center',
+      wrap: figure.dataset.wrap === 'true',
+      caption: figure.querySelector('[data-image-caption]')?.textContent ?? '',
+    });
+  };
+
+  useEffect(() => {
+    const editor = bodyRef.current;
+    if (!editor) return;
+    editor.innerHTML = props.note.content;
+    const checklistMarkupChanged = migrateLegacyChecklistItems(editor);
+    const imageMarkupChanged = migrateLegacyImages(editor);
+    const migrated = checklistMarkupChanged || imageMarkupChanged;
+    if (migrated) {
+      const updated = { ...props.note, content: editor.innerHTML };
+      latestNoteRef.current = updated;
+      setBody(updated.content);
+      props.onSave(updated);
+    }
+  }, [props.note.id]);
 
   useEffect(() => {
     const handleSelection = () => {
       const selection = window.getSelection();
       if (!selection || !bodyRef.current || !selection.anchorNode || !bodyRef.current.contains(selection.anchorNode)) {
         setHasSelection(false);
-        setImageSelected(false);
         return;
       }
       const selected = selection.toString().length > 0;
-      setHasSelection(selected);
       const node = selection.anchorNode.nodeType === Node.ELEMENT_NODE ? selection.anchorNode as Element : selection.anchorNode.parentElement;
-      const image = node?.closest('img') as HTMLImageElement | null;
-      selectedImageRef.current = image;
-      setImageSelected(Boolean(image));
+      const image = node?.closest('img');
+      const figure = image?.closest('figure[data-note-image]') as HTMLElement | null;
+      if (figure) {
+        selectImage(figure);
+        setHasSelection(false);
+      } else if (selected) {
+        selectedImageRef.current = null;
+        setImageSelected(false);
+        setHasSelection(true);
+      } else {
+        selectedImageRef.current = null;
+        setImageSelected(false);
+        setHasSelection(false);
+      }
       if (selection.rangeCount) rangeRef.current = selection.getRangeAt(0).cloneRange();
     };
     document.addEventListener('selectionchange', handleSelection);
@@ -373,6 +435,20 @@ function NoteEditor(props: {
     scheduleSave(title, value);
   };
 
+  const updateSelectedImage = (partial: Partial<ImageOptions>) => {
+    const figure = selectedImageRef.current;
+    if (!figure) return;
+    const next = { ...imageOptions, ...partial };
+    if (next.size !== 'small') next.wrap = false;
+    figure.dataset.size = next.size;
+    figure.dataset.align = next.alignment;
+    figure.dataset.wrap = String(next.wrap);
+    const caption = figure.querySelector<HTMLElement>('[data-image-caption]');
+    if (caption && caption.textContent !== next.caption) caption.textContent = next.caption;
+    setImageOptions(next);
+    handleBody();
+  };
+
   const applyFormat = (command: string) => {
     bodyRef.current?.focus();
     if (rangeRef.current) {
@@ -385,8 +461,22 @@ function NoteEditor(props: {
   };
 
   const insertChecklistItem = () => {
-    bodyRef.current?.focus();
-    document.execCommand('insertHTML', false, '<ul><li data-check-item><input type="checkbox"> </li></ul><p><br></p>');
+    const editor = bodyRef.current;
+    if (!editor) return;
+    const row = createChecklistItem();
+    const selection = window.getSelection();
+    const anchor = selection?.anchorNode;
+    const currentItem = anchor
+      ? (anchor.nodeType === Node.ELEMENT_NODE ? anchor as Element : anchor.parentElement)?.closest('[data-check-item]')
+      : null;
+    const currentParagraph = anchor
+      ? (anchor.nodeType === Node.ELEMENT_NODE ? anchor as Element : anchor.parentElement)?.closest('p')
+      : null;
+    if (currentItem && editor.contains(currentItem)) currentItem.after(row);
+    else if (currentParagraph && editor.contains(currentParagraph)) currentParagraph.after(row);
+    else editor.append(row);
+    placeCaretAtStart(row.querySelector<HTMLElement>('[data-check-text]')!);
+    setEditorFocused(true);
     handleBody();
   };
 
@@ -415,13 +505,21 @@ function NoteEditor(props: {
     reader.onload = () => {
       const editor = bodyRef.current;
       if (!editor || typeof reader.result !== 'string') return;
-      editor.focus();
-      const selection = window.getSelection();
-      if (rangeRef.current) {
-        selection?.removeAllRanges();
-        selection?.addRange(rangeRef.current);
-      }
-      document.execCommand('insertHTML', false, `<img src="${reader.result}" alt="${file.name.replace(/[&"'<>]/g, '')}"><p><br></p>`);
+      const image = document.createElement('img');
+      image.src = reader.result;
+      image.alt = file.name;
+      const figure = createImageFigure(image);
+      const range = rangeRef.current && editor.contains(rangeRef.current.commonAncestorContainer)
+        ? rangeRef.current
+        : (() => {
+            const next = document.createRange();
+            next.selectNodeContents(editor);
+            next.collapse(false);
+            return next;
+          })();
+      insertImageFigure(editor, range, figure);
+      selectImage(figure);
+      setEditorFocused(true);
       handleBody();
     };
     reader.readAsDataURL(file);
@@ -441,8 +539,7 @@ function NoteEditor(props: {
   };
   const removeSelectedImage = () => {
     selectedImageRef.current?.remove();
-    selectedImageRef.current = null;
-    setImageSelected(false);
+    selectImage(null);
     handleBody();
   };
 
@@ -452,17 +549,22 @@ function NoteEditor(props: {
         <button onClick={leaveEditor} className="control-focus flex items-center gap-2 rounded-full px-2 py-2 text-sm text-[#89847b] transition hover:text-[#e4dccf]" data-testid="button-back-home">
           <ArrowLeft size={17} strokeWidth={1.6} /><span className="hidden sm:inline">All pages</span>
         </button>
-        <div className="flex items-center gap-2 text-[11px] text-[#66625b]" data-testid="status-save-state">
-          {props.saveState === 'saved' ? <Check size={13} className="text-[#807b6e]" /> : null}
-          <span>{saveStatus}</span>
-        </div>
-        <div className="relative">
-          <button onClick={() => setMoreOpen(value => !value)} className="control-focus grid h-9 w-9 place-items-center rounded-full text-[#79756e] hover:bg-[#141311] hover:text-[#d7d0c4]" aria-label="More note actions" data-testid="button-note-menu">
-            <MoreHorizontal size={19} />
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 text-[11px] text-[#66625b]" data-testid="status-save-state">
+            {props.saveState === 'saved' ? <Check size={13} className="text-[#807b6e]" /> : null}
+            <span>{saveStatus}</span>
+          </div>
+          <button onClick={props.onSettings} className="control-focus grid h-9 w-9 place-items-center rounded-full text-[#79756e] transition hover:bg-[#141311] hover:text-[#d7d0c4]" aria-label="Writing settings" data-testid="button-editor-settings">
+            <Settings size={17} strokeWidth={1.55} />
           </button>
-          {moreOpen && <div className="absolute right-0 top-11 z-10 w-44 rounded-xl border border-[#2d2b27] bg-[#11110f] p-1.5 shadow-xl">
-            <button onClick={removeCurrentPage} className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-sm text-[#c39a8a] hover:bg-[#211917]" data-testid="button-delete-current-note"><Trash2 size={15} /> Delete page</button>
-          </div>}
+          <div className="relative">
+            <button onClick={() => setMoreOpen(value => !value)} className="control-focus grid h-9 w-9 place-items-center rounded-full text-[#79756e] hover:bg-[#141311] hover:text-[#d7d0c4]" aria-label="More note actions" data-testid="button-note-menu">
+              <MoreHorizontal size={19} />
+            </button>
+            {moreOpen && <div className="absolute right-0 top-11 z-10 w-44 rounded-xl border border-[#2d2b27] bg-[#11110f] p-1.5 shadow-xl">
+              <button onClick={removeCurrentPage} className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-sm text-[#c39a8a] hover:bg-[#211917]" data-testid="button-delete-current-note"><Trash2 size={15} /> Delete page</button>
+            </div>}
+          </div>
         </div>
       </header>
 
@@ -479,20 +581,34 @@ function NoteEditor(props: {
           className="mb-7 w-full border-0 bg-transparent p-0 font-[var(--app-font-serif)] text-[clamp(2rem,6vw,3.1rem)] font-normal leading-[1.15] tracking-[-.035em] text-[#e3ddd2] outline-none placeholder:text-[#4a4741]"
           data-testid="input-note-title"
         />
-        <div className="relative mb-5 flex min-h-9 items-center gap-1">
-          <button onMouseDown={event => event.preventDefault()} onClick={chooseImage} className="control-focus inline-flex items-center gap-2 rounded-md px-2.5 py-2 text-xs text-[#77736c] transition hover:bg-[#151412] hover:text-[#d5cbb8]" data-testid="button-insert-image">
-            <ImagePlus size={15} strokeWidth={1.6} /><span>Add image</span>
-          </button>
-          {(props.note.kind === 'checklist' || props.note.kind === 'task') && <button onMouseDown={event => event.preventDefault()} onClick={insertChecklistItem} className="control-focus inline-flex items-center gap-2 rounded-md px-2.5 py-2 text-xs text-[#77736c] transition hover:bg-[#151412] hover:text-[#d5cbb8]" data-testid="button-add-checklist-item"><ListChecks size={15} />Add item</button>}
-          {hasSelection && <div className="ml-auto flex items-center gap-0.5 rounded-lg border border-[#302e29] bg-[#11110f] p-1 soft-in" data-testid="toolbar-formatting">
-            <FormatButton label="Bold" icon={<Bold size={15} />} action={() => applyFormat('bold')} id="button-format-bold" />
-            <FormatButton label="Italic" icon={<Italic size={15} />} action={() => applyFormat('italic')} id="button-format-italic" />
-            <FormatButton label="Underline" icon={<Underline size={15} />} action={() => applyFormat('underline')} id="button-format-underline" />
-          </div>}
-          {imageSelected && <div className="ml-auto flex items-center gap-1 rounded-lg border border-[#302e29] bg-[#11110f] p-1 soft-in" data-testid="toolbar-image">
-            <span className="px-2 text-[11px] text-[#77736c]">Image</span>
-            <button onMouseDown={event => event.preventDefault()} onClick={removeSelectedImage} className="control-focus rounded-md px-2.5 py-1.5 text-xs text-[#c39a8a] hover:bg-[#251a17]" data-testid="button-remove-image">Remove</button>
-          </div>}
+        <div ref={toolbarRef} className="relative mb-5 flex min-h-9 flex-wrap items-center gap-1">
+          {(editorFocused || hasSelection || imageSelected) && (
+            <>
+              <button onMouseDown={event => event.preventDefault()} onClick={chooseImage} className="control-focus inline-flex items-center gap-2 rounded-md px-2.5 py-2 text-xs text-[#77736c] transition hover:bg-[#151412] hover:text-[#d5cbb8]" data-testid="button-insert-image">
+                <ImagePlus size={15} strokeWidth={1.6} /><span>Add image</span>
+              </button>
+              {(props.note.kind === 'checklist' || props.note.kind === 'task') && <button onMouseDown={event => event.preventDefault()} onClick={insertChecklistItem} className="control-focus inline-flex items-center gap-2 rounded-md px-2.5 py-2 text-xs text-[#77736c] transition hover:bg-[#151412] hover:text-[#d5cbb8]" data-testid="button-add-checklist-item"><ListChecks size={15} />Add item</button>}
+              {hasSelection && <div className="ml-auto flex items-center gap-0.5 rounded-lg border border-[#302e29] bg-[#11110f] p-1 soft-in" data-testid="toolbar-formatting">
+                <FormatButton label="Bold" icon={<Bold size={15} />} action={() => applyFormat('bold')} id="button-format-bold" />
+                <FormatButton label="Italic" icon={<Italic size={15} />} action={() => applyFormat('italic')} id="button-format-italic" />
+                <FormatButton label="Underline" icon={<Underline size={15} />} action={() => applyFormat('underline')} id="button-format-underline" />
+              </div>}
+              {imageSelected && <div className="ml-auto flex max-w-full flex-wrap items-center gap-1 rounded-lg border border-[#302e29] bg-[#11110f] p-2 soft-in" data-testid="toolbar-image">
+                <label className="sr-only" htmlFor="image-size">Image size</label>
+                <select id="image-size" value={imageOptions.size} onChange={event => updateSelectedImage({ size: event.target.value as ImageSize })} className="control-focus rounded-md border border-[#302e29] bg-[#11110f] px-2 py-1.5 text-xs text-[#c8c1b6]" data-testid="select-image-size">
+                  <option value="small">Small</option><option value="medium">Medium</option><option value="full">Full</option>
+                </select>
+                <div className="flex items-center gap-0.5" role="group" aria-label="Image alignment">
+                  <button onMouseDown={event => event.preventDefault()} onClick={() => updateSelectedImage({ alignment: 'left' })} className={`control-focus grid h-8 w-8 place-items-center rounded-md ${imageOptions.alignment === 'left' ? 'bg-[#25231e] text-[#e1d7c4]' : 'text-[#9a958a]'}`} aria-label="Align image left" aria-pressed={imageOptions.alignment === 'left'} data-testid="button-image-align-left"><AlignLeft size={15} /></button>
+                  <button onMouseDown={event => event.preventDefault()} onClick={() => updateSelectedImage({ alignment: 'center' })} className={`control-focus grid h-8 w-8 place-items-center rounded-md ${imageOptions.alignment === 'center' ? 'bg-[#25231e] text-[#e1d7c4]' : 'text-[#9a958a]'}`} aria-label="Align image center" aria-pressed={imageOptions.alignment === 'center'} data-testid="button-image-align-center"><AlignCenter size={15} /></button>
+                  <button onMouseDown={event => event.preventDefault()} onClick={() => updateSelectedImage({ alignment: 'right' })} className={`control-focus grid h-8 w-8 place-items-center rounded-md ${imageOptions.alignment === 'right' ? 'bg-[#25231e] text-[#e1d7c4]' : 'text-[#9a958a]'}`} aria-label="Align image right" aria-pressed={imageOptions.alignment === 'right'} data-testid="button-image-align-right"><AlignRight size={15} /></button>
+                </div>
+                <button onMouseDown={event => event.preventDefault()} onClick={() => updateSelectedImage({ wrap: !imageOptions.wrap })} disabled={imageOptions.size !== 'small'} className="control-focus rounded-md px-2.5 py-1.5 text-xs text-[#aaa398] hover:bg-[#25231e] disabled:cursor-not-allowed disabled:opacity-40" aria-pressed={imageOptions.wrap} data-testid="button-image-wrap">Wrap text</button>
+                <input value={imageOptions.caption} onChange={event => updateSelectedImage({ caption: event.target.value })} placeholder="Caption" aria-label="Image caption" className="control-focus min-w-[90px] flex-1 rounded-md border border-[#302e29] bg-transparent px-2.5 py-1.5 text-xs text-[#c8c1b6] placeholder:text-[#615d55]" data-testid="input-image-caption" />
+                <button onMouseDown={event => event.preventDefault()} onClick={removeSelectedImage} className="control-focus rounded-md px-2.5 py-1.5 text-xs text-[#c39a8a] hover:bg-[#251a17]" data-testid="button-remove-image">Remove</button>
+              </div>}
+            </>
+          )}
         </div>
         <div
           ref={bodyRef}
@@ -505,15 +621,63 @@ function NoteEditor(props: {
           data-placeholder={props.note.kind === 'journal' ? 'Begin with what stayed with you…' : props.note.kind === 'task' ? 'What needs doing?' : props.note.kind === 'checklist' ? 'Add a thought, then make a list…' : 'Begin anywhere…'}
           style={{ fontFamily: props.settings.fontFamily === 'Georgia' ? 'Georgia, serif' : "'Literata', Georgia, serif", fontSize: `${props.settings.fontSize}px`, lineHeight: props.settings.lineSpacing }}
           onInput={handleBody}
+          onFocus={() => setEditorFocused(true)}
+          onBlur={event => {
+            if (event.relatedTarget && toolbarRef.current?.contains(event.relatedTarget as Node)) return;
+            setEditorFocused(false);
+          }}
           onClick={event => {
             const target = event.target;
+            if (target instanceof HTMLInputElement && target.type === 'checkbox') {
+              window.setTimeout(() => {
+                if (!bodyRef.current?.contains(target)) return;
+                if (target.checked) target.setAttribute('checked', '');
+                else target.removeAttribute('checked');
+                handleBody();
+              }, 0);
+              return;
+            }
             if (target instanceof HTMLImageElement) {
-              selectedImageRef.current = target;
-              setImageSelected(true);
-              setHasSelection(false);
+              selectImage(target.closest('figure[data-note-image]') as HTMLElement | null);
+              setEditorFocused(true);
+            } else if (target instanceof HTMLElement && !target.closest('[data-note-image]')) {
+              selectImage(null);
+            }
+          }}
+          onChange={event => {
+            const target = event.target;
+            if (target instanceof HTMLInputElement && target.type === 'checkbox') {
+              if (target.checked) target.setAttribute('checked', '');
+              else target.removeAttribute('checked');
+              handleBody();
             }
           }}
           onKeyDown={event => {
+            const target = event.target;
+            const selectionAnchor = window.getSelection()?.anchorNode;
+            const selectionElement = selectionAnchor?.nodeType === Node.ELEMENT_NODE
+              ? selectionAnchor as Element
+              : selectionAnchor?.parentElement;
+            const checkText = (target instanceof HTMLElement ? target.closest<HTMLElement>('[data-check-text]') : null)
+              ?? selectionElement?.closest<HTMLElement>('[data-check-text]')
+              ?? null;
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && checkText) {
+              event.preventDefault();
+              const row = checkText.closest<HTMLElement>('[data-check-item]');
+              if (checkText.textContent?.trim()) {
+                const next = createChecklistItem();
+                row?.after(next);
+                placeCaretAtStart(next.querySelector<HTMLElement>('[data-check-text]')!);
+              } else {
+                const outsideParagraph = document.createElement('p');
+                outsideParagraph.innerHTML = '<br>';
+                row?.after(outsideParagraph);
+                row?.remove();
+                placeCaretAtStart(outsideParagraph);
+              }
+              handleBody();
+              return;
+            }
             if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
               event.preventDefault();
               if (timerRef.current) clearTimeout(timerRef.current);
