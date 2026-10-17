@@ -6,7 +6,7 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
 import { Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
 import {
-  AlignCenter, AlignLeft, AlignRight, ArrowLeft, Bold, Check, Clock3, FileText,
+AlignCenter, AlignLeft, AlignRight, ArrowLeft, Bold, Check, Clock3, FileText,
   ImagePlus, Italic, ListChecks, ListTodo, MoreHorizontal, Plus, Search, Settings,
   Trash2, Underline,
   X,
@@ -33,7 +33,6 @@ function formatDate(timestamp: number) {
   const date = new Date(timestamp);
   const today = new Date();
   const sameDay = date.toDateString() === today.toDateString();
-  if (sameDay) return `Today · ${date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
   const yesterday = new Date(today);
   yesterday.setDate(yesterday.getDate() - 1);
   if (date.toDateString() === yesterday.toDateString()) return 'Yesterday';
@@ -250,8 +249,8 @@ function HomeScreen(props: {
       <div className="mb-14">
         <div className="mb-7 flex items-end justify-between gap-4">
           <div>
-            <h1 className="m-0 font-[var(--app-font-serif)] text-[clamp(2rem,5vw,3.15rem)] font-normal leading-tight tracking-[-.035em] text-[#ded8cd]">A little room to think.</h1>
-            <p className="mb-0 mt-3 font-[var(--app-font-serif)] text-base text-[#69655f]">Come back to what matters.</p>
+            <h1 className="m-0 font-serif text-[clamp(2rem,5vw,3.15rem)] font-normal leading-tight tracking-[-.035em] text-[#ded8cd]">A little room to think.</h1>
+            <p className="mb-0 mt-3 font-serif text-base text-[#69655f]">Come back to what matters.</p>
           </div>
           <div className="relative shrink-0">
             <button onClick={props.onCreate} aria-label="Create a page" className="control-focus grid h-[50px] w-[50px] place-items-center rounded-full border border-[#4a443a] bg-[#c9b999] text-[#171511] transition hover:bg-[#ddcdb0]" data-testid="button-open-create-menu">
@@ -303,10 +302,10 @@ function HomeScreen(props: {
           <article key={note.id} className="group relative flex items-start gap-3 py-5" data-testid={`card-note-${note.id}`}>
             <button onClick={() => props.onOpen(note)} className="control-focus min-w-0 flex-1 text-left" data-testid={`button-open-note-${note.id}`}>
               <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-                <h2 className="m-0 truncate font-[var(--app-font-serif)] text-[19px] font-normal text-[#d6d0c5] group-hover:text-[#eee7dc]">{note.title.trim() || kindNames[note.kind]}</h2>
+                <h2 className="m-0 truncate font-serif text-[19px] font-normal text-[#d6d0c5] group-hover:text-[#eee7dc]">{note.title.trim() || kindNames[note.kind]}</h2>
                 <span className="shrink-0 text-[11px] text-[#5f5c56]" data-testid={`text-updated-${note.id}`}>{formatDate(note.updatedAt)}</span>
               </div>
-              <p className="m-0 truncate font-[var(--app-font-serif)] text-sm leading-relaxed text-[#74706a]" data-testid={`text-preview-${note.id}`}>{notePreview(note)}</p>
+              <p className="m-0 truncate font-serif text-sm leading-relaxed text-[#74706a]" data-testid={`text-preview-${note.id}`}>{notePreview(note)}</p>
             </button>
             <button onClick={() => props.onDelete(note)} className="control-focus mt-1 grid h-8 w-8 shrink-0 place-items-center rounded-full text-[#57544e] opacity-0 transition hover:bg-[#211a18] hover:text-[#c38f7e] focus:opacity-100 group-hover:opacity-100" aria-label={`Delete ${note.title || kindNames[note.kind]}`} data-testid={`button-delete-note-${note.id}`}>
               <Trash2 size={15} strokeWidth={1.6} />
@@ -315,8 +314,8 @@ function HomeScreen(props: {
         ))}
         {!props.loading && !props.loadError && props.notes.length === 0 && (
           <div className="py-12" data-testid="empty-notes">
-            <p className="m-0 font-[var(--app-font-serif)] text-xl text-[#777168]">{props.search ? 'Nothing found.' : 'The page is yours.'}</p>
-            <p className="mb-0 mt-2 max-w-sm font-[var(--app-font-serif)] text-sm leading-relaxed text-[#514e48]">{props.search ? 'Try another word, or clear your search.' : 'Start anywhere. A thought, a list, a day worth keeping.'}</p>
+            <p className="m-0 font-serif text-xl text-[#777168]">{props.search ? 'Nothing found.' : 'The page is yours.'}</p>
+            <p className="mb-0 mt-2 max-w-sm font-serif text-sm leading-relaxed text-[#514e48]">{props.search ? 'Try another word, or clear your search.' : 'Start anywhere. A thought, a list, a day worth keeping.'}</p>
           </div>
         )}
       </div>
@@ -581,16 +580,15 @@ function NoteEditor(props: {
           onChange={event => handleTitle(event.target.value)}
           placeholder="Untitled"
           aria-label="Page title"
-          className="mb-7 w-full border-0 bg-transparent p-0 font-[var(--app-font-serif)] text-[clamp(2rem,6vw,3.1rem)] font-normal leading-[1.15] tracking-[-.035em] text-[#e3ddd2] outline-none placeholder:text-[#4a4741]"
-          style={{ fontFamily: writingFontFamily }}
+          className="mb-7 w-full border-0 bg-transparent p-0 font-serif text-[clamp(2rem,6vw,3.1rem)] font-normal leading-[1.15] tracking-[-.035em] text-[#e3ddd2] outline-none placeholder:text-[#4a4741]"
           data-testid="input-note-title"
         />
         <div ref={toolbarRef} className="relative mb-5 flex min-h-9 flex-wrap items-center gap-1">
+          <button onMouseDown={event => event.preventDefault()} onClick={chooseImage} className="control-focus inline-flex items-center gap-2 rounded-md px-2.5 py-2 text-xs text-[#77736c] transition hover:bg-[#151412] hover:text-[#d5cbb8]" data-testid="button-insert-image">
+            <ImagePlus size={15} strokeWidth={1.6} /><span>Add image</span>
+          </button>
           {(editorFocused || hasSelection || imageSelected) && (
             <>
-              <button onMouseDown={event => event.preventDefault()} onClick={chooseImage} className="control-focus inline-flex items-center gap-2 rounded-md px-2.5 py-2 text-xs text-[#77736c] transition hover:bg-[#151412] hover:text-[#d5cbb8]" data-testid="button-insert-image">
-                <ImagePlus size={15} strokeWidth={1.6} /><span>Add image</span>
-              </button>
               {(props.note.kind === 'checklist' || props.note.kind === 'task') && <button onMouseDown={event => event.preventDefault()} onClick={insertChecklistItem} className="control-focus inline-flex items-center gap-2 rounded-md px-2.5 py-2 text-xs text-[#77736c] transition hover:bg-[#151412] hover:text-[#d5cbb8]" data-testid="button-add-checklist-item"><ListChecks size={15} />Add item</button>}
               {hasSelection && <div className="ml-auto flex items-center gap-0.5 rounded-lg border border-[#302e29] bg-[#11110f] p-1 soft-in" data-testid="toolbar-formatting">
                 <FormatButton label="Bold" icon={<Bold size={15} />} action={() => applyFormat('bold')} id="button-format-bold" />
@@ -616,7 +614,7 @@ function NoteEditor(props: {
         </div>
         <div
           ref={bodyRef}
-          className="note-body min-h-[18vh] font-[var(--editor-font)] text-[#cfc9bf] caret-[#d1bd98] selection:bg-[#594d37]"
+          className="note-body min-h-[42vh] font-[var(--editor-font)] text-[#cfc9bf] caret-[#d1bd98] selection:bg-[#594d37]"
           contentEditable
           suppressContentEditableWarning
           role="textbox"
@@ -707,8 +705,8 @@ function SettingsScreen(props: {
       </header>
       <div className="mt-[clamp(3rem,12vh,7rem)]">
         <p className="mb-3 text-[10px] uppercase tracking-[.22em] text-[#6b665d]">Your space</p>
-        <h1 className="m-0 font-[var(--app-font-serif)] text-4xl font-normal tracking-[-.03em] text-[#e1dbcf]">Writing, your way.</h1>
-        <p className="mt-3 max-w-md font-[var(--app-font-serif)] text-base leading-relaxed text-[#777168]">A few quiet choices for how your words sit on the page.</p>
+        <h1 className="m-0 font-serif text-4xl font-normal tracking-[-.03em] text-[#e1dbcf]">Writing, your way.</h1>
+        <p className="mt-3 max-w-md font-serif text-base leading-relaxed text-[#777168]">A few quiet choices for how your words sit on the page.</p>
       </div>
       <div className="mt-14 divide-y divide-[#201f1c] border-y border-[#201f1c]">
         <div className="flex flex-col gap-5 py-6 sm:flex-row sm:items-center sm:justify-between">
@@ -720,9 +718,9 @@ function SettingsScreen(props: {
         <div className="flex flex-col gap-5 py-6 sm:flex-row sm:items-center sm:justify-between">
           <div><h2 className="m-0 text-sm font-medium text-[#d5cec2]">Letter size</h2><p className="mb-0 mt-1 text-xs text-[#68645d]">Comfort, not a fixed rule</p></div>
           <div className="flex items-center gap-4">
-            <span className="font-[var(--app-font-serif)] text-sm text-[#827c71]">A</span>
+            <span className="font-serif text-sm text-[#827c71]">A</span>
             <input type="range" min="16" max="30" step="1" value={props.settings.fontSize} onChange={event => update({ fontSize: Number(event.target.value) })} className="w-40 accent-[#b6a27e]" aria-label="Writing font size" data-testid="input-font-size" />
-            <span className="font-[var(--app-font-serif)] text-2xl text-[#cfc5b1]">A</span>
+            <span className="font-serif text-2xl text-[#cfc5b1]">A</span>
             <span className="w-7 text-right text-xs tabular-nums text-[#716b60]" data-testid="text-font-size-value">{props.settings.fontSize}</span>
           </div>
         </div>
