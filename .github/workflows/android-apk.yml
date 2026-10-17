@@ -32,7 +32,10 @@ jobs:
           java-version: 21
       - uses: android-actions/setup-android@v3
         with:
-          accept-android-sdk-licenses: true
+          accept-android-sdk-licenses: false
+          packages: ''
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses
       - name: Install Android SDK packages
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
       - name: Install workspace dependencies
