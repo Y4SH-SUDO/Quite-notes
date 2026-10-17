@@ -36,6 +36,9 @@ import {
 
 const queryClient = new QueryClient();
 const cloudSyncTimeoutMs = 60_000;
+const routerBase = import.meta.env.BASE_URL.startsWith('/')
+  ? import.meta.env.BASE_URL.replace(/\/$/, '')
+  : '';
 const kindNames: Record<NoteKind, string> = {
   note: 'Note',
   task: 'Task',
@@ -1707,7 +1710,7 @@ function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, '')}>
+        <WouterRouter base={routerBase}>
           <Router />
         </WouterRouter>
         <Toaster />

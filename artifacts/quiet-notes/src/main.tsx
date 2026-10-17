@@ -15,3 +15,4 @@ createRoot(document.getElementById('root')!, {
     <App />
   </ErrorBoundary>,
 );
+window.dispatchEvent(new Event('quiet-notes-started'));
