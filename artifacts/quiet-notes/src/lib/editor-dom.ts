@@ -126,7 +126,7 @@ export function migrateLegacyImages(editor: HTMLElement): boolean {
   return images.length > 0;
 }
 
-function paragraphHasContent(paragraph: HTMLParagraphElement): boolean {
+function paragraphHasContent(paragraph: HTMLElement): boolean {
   return Boolean(paragraph.textContent?.trim() || paragraph.querySelector('img, input, figure'));
 }
 
@@ -138,24 +138,25 @@ export function insertImageFigure(
   const insertion = range.cloneRange();
   insertion.deleteContents();
   const start = insertion.startContainer;
-  const paragraph = start.nodeType === Node.ELEMENT_NODE
-    ? (start as Element).closest('p')
-    : start.parentElement?.closest('p');
+  const blockElement = start.nodeType === Node.ELEMENT_NODE
+    ? (start as Element).closest('p, div:not([data-check-item])')
+    : start.parentElement?.closest('p, div:not([data-check-item])');
+  const block = blockElement instanceof HTMLElement ? blockElement : null;
 
-  if (paragraph && editor.contains(paragraph) && (paragraph === start || paragraph.contains(start))) {
+  if (block && block !== editor && editor.contains(block) && (block === start || block.contains(start))) {
     const tailRange = document.createRange();
-    tailRange.selectNodeContents(paragraph);
+    tailRange.selectNodeContents(block);
     tailRange.setStart(start, insertion.startOffset);
     const tail = tailRange.extractContents();
-    const afterParagraph = paragraph.cloneNode(false) as HTMLParagraphElement;
+    const afterParagraph = block.cloneNode(false) as HTMLElement;
     afterParagraph.append(tail);
     if (!afterParagraph.hasChildNodes()) afterParagraph.innerHTML = '<br>';
 
-    if (paragraphHasContent(paragraph)) {
-      paragraph.after(figure, afterParagraph);
+    if (paragraphHasContent(block)) {
+      block.after(figure, afterParagraph);
     } else {
-      paragraph.before(figure, afterParagraph);
-      paragraph.remove();
+      block.before(figure, afterParagraph);
+      block.remove();
     }
     placeCaretAtStart(afterParagraph);
     return;

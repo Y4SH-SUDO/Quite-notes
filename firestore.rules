@@ -1,0 +1,37 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userId}/notes/{noteId} {
+      function isOwner() {
+        return request.auth != null && request.auth.uid == userId;
+      }
+
+      function validNoteDocument() {
+        return request.resource.data.keys().hasOnly(['schemaVersion', 'note'])
+          && request.resource.data.schemaVersion == 1
+          && request.resource.data.note.keys().hasOnly([
+            'id', 'title', 'kind', 'content', 'createdAt', 'updatedAt',
+            'recentlyOpenedAt', 'dueDate', 'reminderAt', 'reminderTimezone'
+          ])
+          && request.resource.data.note.id == noteId
+          && request.resource.data.note.kind in ['note', 'task', 'journal', 'checklist']
+          && request.resource.data.note.title is string
+          && request.resource.data.note.content is string
+          && request.resource.data.note.createdAt is number
+          && request.resource.data.note.updatedAt is number
+          && request.resource.data.note.recentlyOpenedAt is number
+          && (!('dueDate' in request.resource.data.note) || request.resource.data.note.dueDate is string)
+          && (!('reminderAt' in request.resource.data.note) || request.resource.data.note.reminderAt is number)
+          && (!('reminderTimezone' in request.resource.data.note) || request.resource.data.note.reminderTimezone is string)
+          && (request.resource.data.note.kind == 'task'
+            || (!('dueDate' in request.resource.data.note)
+              && !('reminderAt' in request.resource.data.note)
+              && !('reminderTimezone' in request.resource.data.note)));
+      }
+
+      allow read: if isOwner();
+      allow create, update: if isOwner() && validNoteDocument();
+      allow delete: if isOwner();
+    }
+  }
+}
