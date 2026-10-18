@@ -7,6 +7,7 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(OfflineBackupPlugin.class);
+        registerPlugin(ImmersiveReaderPlugin.class);
         super.onCreate(savedInstanceState);
     }
 }

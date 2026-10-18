@@ -16,8 +16,11 @@ and not favorited.
 Reading-library backups include document titles, format, reading position, bookmarks,
 highlights, and attached thoughts. They do not include imported PDF, EPUB, or text file
 binaries; after restoring such a backup, re-import the original document to continue
-reading. Handwriting is saved as vector stroke data on its note and is included in
-backup version 2.
+reading. Bookmark names can be edited without changing their saved reading locations.
+PDF highlights are anchored to selectable text on a page; EPUB highlights use EPUB CFI
+locations. Android full-screen reading hides the system bars through the native
+Capacitor bridge, with an in-reader control to reveal controls or exit. Handwriting is
+saved as vector stroke data on its note and is included in backup version 2.
 
 Restore validates the complete JSON before showing an import preview. Merge imports
 only new note IDs and leaves existing records untouched; the alternative skips the
@@ -37,10 +40,10 @@ physical destruction of the phone.
 
 Imported documents are stored locally in the existing IndexedDB database and are
 limited to 50 MB each. PDF text highlighting depends on a selectable text layer;
-scanned pages can still be read and bookmarked but are not OCR'd. Finger drawing on
-the handwriting canvas is off by default; pen pressure is used when exposed by the
-Android WebView, with a fallback otherwise. Browser pointer events do not provide
-Samsung Notes-level palm rejection.
+scanned pages can still be read and bookmarked but are not OCR'd or highlightable.
+Finger drawing on the handwriting canvas is off by default; pen pressure is used
+when exposed by the Android WebView, with a fallback otherwise. Browser pointer
+events do not provide Samsung Notes-level palm rejection.
 
 ## Android release and in-place update
 

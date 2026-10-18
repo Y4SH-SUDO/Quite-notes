@@ -108,3 +108,26 @@ export function toLibraryDocumentBackup(document: LibraryDocument): LibraryDocum
 export function restoreLibraryDocument(record: LibraryDocumentBackup): LibraryDocument {
   return { ...record, bookmarks: record.bookmarks.map(item => ({ ...item })), highlights: record.highlights.map(item => ({ ...item })), requiresReimport: true };
 }
+
+export function renameReadingBookmark(
+  document: LibraryDocument,
+  bookmarkId: string,
+  proposedLabel: string,
+  now = Date.now(),
+): LibraryDocument {
+  const label = proposedLabel.trim();
+  if (!label) throw new Error('Enter a name for this bookmark.');
+  if (!document.bookmarks.some(bookmark => bookmark.id === bookmarkId)) {
+    throw new Error('This bookmark no longer exists.');
+  }
+  if (document.bookmarks.some(bookmark =>
+    bookmark.id !== bookmarkId && bookmark.label.trim().toLocaleLowerCase() === label.toLocaleLowerCase())) {
+    throw new Error('A bookmark already uses that name.');
+  }
+  return {
+    ...document,
+    bookmarks: document.bookmarks.map(bookmark =>
+      bookmark.id === bookmarkId ? { ...bookmark, label } : bookmark),
+    updatedAt: Math.max(now, document.updatedAt + 1),
+  };
+}

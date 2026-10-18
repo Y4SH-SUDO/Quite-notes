@@ -242,7 +242,9 @@ function AppSurface() {
         if (editorBackHandlerRef.current) editorBackHandlerRef.current();
         else setScreen(returnScreenRef.current);
       } else if (currentScreen === 'reader') {
-        setScreen('reading-library');
+        const backEvent = new Event('quiet-notes-reader-back', { cancelable: true });
+        window.dispatchEvent(backEvent);
+        if (!backEvent.defaultPrevented) setScreen('reading-library');
       } else if (currentScreen === 'library' || currentScreen === 'reading-library' || currentScreen === 'settings') {
         setScreen('home');
       } else {
