@@ -55,7 +55,10 @@ button, input, select { font: inherit; }
 button { -webkit-tap-highlight-color: transparent; }
 ::selection { background: rgba(203, 183, 146, .3); }
 
-.quiet-shell { min-height: 100dvh; background: #000; }
+.quiet-shell { min-height: 100dvh; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); background: #000; }
+.screen-enter { animation: screen-enter .18s ease-out both; }
+@keyframes screen-enter { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+.note-state-mark { animation: screen-enter .16s ease-out both; }
 .soft-in { animation: soft-in .35s ease both; }
 @keyframes soft-in { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
 .quiet-grain::after {
@@ -65,6 +68,7 @@ button { -webkit-tap-highlight-color: transparent; }
 .note-body { display: flow-root; outline: none; overflow-wrap: anywhere; white-space: pre-wrap; }
 .note-body:empty::before { content: attr(data-placeholder); color: #4b4945; pointer-events: none; }
 .note-body p { margin: 0 0 .72em; }
+.note-body [data-check-text] { font-family: inherit; font-size: inherit; font-weight: inherit; line-height: inherit; color: inherit; }
 .note-body figure[data-note-image] { display: block; max-width: 100%; margin: 1.5rem auto; }
 .note-body figure[data-note-image][data-size="small"] { width: min(34%, 280px); }
 .note-body figure[data-note-image][data-size="medium"] { width: min(64%, 540px); }

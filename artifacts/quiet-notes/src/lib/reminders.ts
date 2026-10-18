@@ -232,6 +232,40 @@ export async function sendBrowserTestNotification(): Promise<string> {
   return result.diagnostics.join('\n');
 }
 
+async function sendNativeTestNotification(): Promise<string> {
+  const permission = await currentReminderPermission();
+  if (permission !== 'granted') {
+    return permission === 'prompt'
+      ? 'Notification permission has not been granted. Enable notifications before sending a test.'
+      : permission === 'denied'
+        ? 'Notification permission is denied. Enable it in Android settings before sending a test.'
+        : 'Native notifications are unavailable on this device.';
+  }
+
+  const result = await LocalNotifications.schedule({
+    notifications: [{
+      id: reminderId('quiet-notes-test', Date.now()),
+      title: 'Quiet Notes',
+      body: 'This is a test of Android local notifications.',
+      schedule: {
+        at: new Date(Date.now() + 2_000),
+      },
+      isExactNotification: false,
+      extra: { quietNotesTest: true },
+    }],
+  });
+  if (result.warning?.message) {
+    return `The Android test notification was scheduled with a warning: ${result.warning.message}`;
+  }
+  return 'The Android test notification was scheduled. Android may delay inexact notifications; delivery cannot be confirmed until it appears on this device.';
+}
+
+export function sendReminderTestNotification(): Promise<string> {
+  return Capacitor.isNativePlatform()
+    ? sendNativeTestNotification()
+    : sendBrowserTestNotification();
+}
+
 function clearBrowserTimers(): void {
   for (const timer of browserTimers.values()) clearTimeout(timer);
   browserTimers.clear();
@@ -335,7 +369,8 @@ export async function scheduleTaskReminders(
           id: reminder.id,
           title: reminder.note.title.trim() || 'Quiet task',
           body: 'It is time to revisit this task.',
-          schedule: { at: new Date(reminder.at), allowWhileIdle: true },
+          schedule: { at: new Date(reminder.at) },
+          isExactNotification: false,
           extra: { quietNotesReminder: true, noteId: reminder.note.id },
         })),
       });

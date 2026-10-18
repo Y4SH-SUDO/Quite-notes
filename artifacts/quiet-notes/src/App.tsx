@@ -1,4 +1,8 @@
-import { type ChangeEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type ChangeEvent, type PointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { App as CapacitorApp } from '@capacitor/app';
+import { Capacitor } from '@capacitor/core';
+import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
@@ -8,20 +12,21 @@ import { Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
 import {
   AlignCenter, AlignLeft, AlignRight, ArrowDown, ArrowLeft, ArrowUp, Bell, Bold, Check,
   Clock3, Download, FileText, ImagePlus, Italic, Library, ListChecks, ListTodo,
-  MoreHorizontal, Plus, Search, Settings, Trash2, Underline,
+  MoreHorizontal, Pin, Plus, Search, Settings, Star, Trash2, Underline,
   Upload, X,
 } from 'lucide-react';
 import {
   defaultSettings, newNote, quietStorage,
-  type BackupImportResult, type NoteKind, type QuietNote, type QuietSettings,
+  sortNotes, type BackupImportResult, type NoteKind, type QuietNote, type QuietSettings,
 } from './quiet-storage';
 import {
   runBackupWorker,
   type ImportStrategy, type QuietNotesBackup,
 } from './lib/backup';
+import { noteFlagSaveCoordinator, NoteFlagSaveCoordinator, type NoteFlag } from './lib/note-actions';
 import {
   currentReminderPermission, requestReminderPermission, scheduleTaskReminders,
-  sendBrowserTestNotification,
+  sendReminderTestNotification,
   type ReminderPermission,
 } from './lib/reminders';
 import { updateTaskSchedule as mergeTaskSchedule } from './lib/task-schedule';
@@ -36,6 +41,7 @@ import {
 
 const queryClient = new QueryClient();
 const cloudSyncTimeoutMs = 60_000;
+const backupChunkSize = 256 * 1024;
 const routerBase = import.meta.env.BASE_URL.startsWith('/')
   ? import.meta.env.BASE_URL.replace(/\/$/, '')
   : '';
@@ -150,11 +156,14 @@ function AppSurface() {
   const [search, setSearch] = useState('');
   const [librarySearch, setLibrarySearch] = useState('');
   const [libraryKind, setLibraryKind] = useState<'all' | NoteKind>('all');
+  const [libraryFavoritesOnly, setLibraryFavoritesOnly] = useState(false);
   const [libraryTag, setLibraryTag] = useState<string | null>(null);
   const [taskFilter, setTaskFilter] = useState<'all' | 'open' | 'complete'>('all');
   const [kindMenu, setKindMenu] = useState(false);
   const [editorSettingsOpen, setEditorSettingsOpen] = useState(false);
   const [storeError, setStoreError] = useState('');
+  const [pendingFlagSaves, setPendingFlagSaves] = useState<ReturnType<NoteFlagSaveCoordinator['getPending']>>([]);
+  const flagSaveCoordinatorRef = useRef(noteFlagSaveCoordinator);
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [saveState, setSaveState] = useState<'saved' | 'saving' | 'error'>('saved');
   const [saveMessage, setSaveMessage] = useState('');
@@ -173,13 +182,58 @@ function AppSurface() {
   const [authPassword, setAuthPassword] = useState('');
   const syncInProgressRef = useRef(false);
   const syncStageRef = useRef('initializing Firebase');
+  const screenRef = useRef(screen);
+  const editorSettingsOpenRef = useRef(editorSettingsOpen);
+  const editorBackHandlerRef = useRef<(() => void) | null>(null);
+  const returnScreenRef = useRef<'home' | 'library'>('home');
+  screenRef.current = screen;
+  editorSettingsOpenRef.current = editorSettingsOpen;
+
+  const registerEditorBackHandler = useCallback((handler: (() => void) | null) => {
+    editorBackHandlerRef.current = handler;
+  }, []);
+
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return;
+    let mounted = true;
+    let listener: { remove: () => Promise<void> } | undefined;
+    void CapacitorApp.addListener('backButton', () => {
+      const currentScreen = screenRef.current;
+      if (currentScreen === 'editor' && editorSettingsOpenRef.current) {
+        setEditorSettingsOpen(false);
+      } else if (currentScreen === 'editor') {
+        if (editorBackHandlerRef.current) editorBackHandlerRef.current();
+        else setScreen(returnScreenRef.current);
+      } else if (currentScreen === 'library' || currentScreen === 'settings') {
+        setScreen('home');
+      } else {
+        void CapacitorApp.exitApp();
+      }
+    }).then(handle => {
+      if (mounted) listener = handle;
+      else void handle.remove();
+    }).catch(error => {
+      setStoreError(error instanceof Error ? error.message : 'Android back-button handling could not be initialized.');
+    });
+    return () => {
+      mounted = false;
+      if (listener) void listener.remove();
+    };
+  }, []);
 
   const refreshNotes = useCallback(async () => {
     try {
       const [storedNotes, storedSettings] = await Promise.all([
         quietStorage.listNotes(), quietStorage.getSettings(),
       ]);
-      setNotes(storedNotes.sort((a, b) => b.recentlyOpenedAt - a.recentlyOpenedAt));
+      const pendingFlags = new Map(
+        (flagSaveCoordinatorRef.current?.getPending() ?? [])
+          .map(pending => [pending.note.id, pending.flags] as const),
+      );
+      setNotes(sortNotes(storedNotes.map(note => {
+        const flags = pendingFlags.get(note.id);
+        return flags ? { ...note, ...flags } : note;
+      })));
       if (storedSettings) setSettings(storedSettings);
       setStoreError('');
       setLoadState('ready');
@@ -332,6 +386,7 @@ function AppSurface() {
       ]);
       const { firestore, storage } = getFirebaseServices();
       const imageFailures = await resolveNoteConflict(firebaseUser.uid, conflict, choice, firestore, storage);
+      setPendingFlagSaves(noteFlagSaveCoordinator.getPending());
       setSyncConflicts(current => current.filter(item => item.id !== conflict.id));
       await refreshNotes();
       setSyncStatus(`Conflict resolved using the selected version.${imageSyncWarning(imageFailures)}`);
@@ -390,18 +445,17 @@ function AppSurface() {
   }, []);
 
   const testReminderNotification = useCallback(async () => {
-    setReminderStatus('Checking this browser and attempting one test notification…');
+    setReminderStatus('Preparing a test notification…');
     try {
-      const diagnostic = await sendBrowserTestNotification();
-      setReminderStatus(`Test notification diagnostic:\n${diagnostic}`);
+      const result = await sendReminderTestNotification();
+      setReminderStatus(result);
     } catch (error) {
       setReminderStatus(`Test notification diagnostic failed: ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`);
     }
   }, []);
 
   const updateNoteMemory = useCallback((updated: QuietNote) => {
-    setNotes(current => [updated, ...current.filter(item => item.id !== updated.id)]
-      .sort((a, b) => b.recentlyOpenedAt - a.recentlyOpenedAt));
+    setNotes(current => sortNotes([updated, ...current.filter(item => item.id !== updated.id)]));
     setActiveNote(updated);
   }, []);
 
@@ -451,6 +505,40 @@ function AppSurface() {
     }
   }, [updateNoteMemory]);
 
+  const publishPendingFlagSaves = useCallback(() => {
+    setPendingFlagSaves(flagSaveCoordinatorRef.current?.getPending() ?? []);
+  }, []);
+
+  const saveFlagChange = useCallback(async (updated: QuietNote, flag: NoteFlag) => {
+    const coordinator = flagSaveCoordinatorRef.current;
+    if (!coordinator) return;
+    const save = coordinator.save(updated, flag, (noteId, flags) => quietStorage.saveNoteFlags(noteId, flags));
+    publishPendingFlagSaves();
+    await save;
+    publishPendingFlagSaves();
+  }, [publishPendingFlagSaves]);
+
+  const toggleNoteFlag = useCallback(async (note: QuietNote, flag: NoteFlag) => {
+    const latest = flagSaveCoordinatorRef.current?.getPendingNote(note.id) ?? note;
+    const updated = {
+      ...latest,
+      [flag]: !latest[flag],
+      updatedAt: Math.max(Date.now(), latest.updatedAt + 1),
+    };
+    setNotes(current => sortNotes([updated, ...current.filter(item => item.id !== updated.id)]));
+    setActiveNote(current => current?.id === updated.id ? updated : current);
+    await saveFlagChange(updated, flag);
+  }, [saveFlagChange]);
+
+  const retryPendingFlagSave = useCallback(async (noteId: string) => {
+    const coordinator = flagSaveCoordinatorRef.current;
+    if (!coordinator) return;
+    const retry = coordinator.retry(noteId, (id, flags) => quietStorage.saveNoteFlags(id, flags));
+    publishPendingFlagSaves();
+    await retry;
+    publishPendingFlagSaves();
+  }, [publishPendingFlagSaves]);
+
   const deleteNote = useCallback(async (note: QuietNote) => {
     if (!window.confirm('Delete this page from this device? This cannot be undone.')) return;
     try {
@@ -493,16 +581,62 @@ function AppSurface() {
       if (!response.ok) throw new Error(response.error);
       if (typeof response.value !== 'string') throw new Error('The backup could not be prepared for download.');
 
+      const filename = `quiet-notes-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      if (Capacitor.isNativePlatform()) {
+        let offset = 0;
+        let end = Math.min(backupChunkSize, response.value.length);
+        if (end < response.value.length && /[\uD800-\uDBFF]/.test(response.value[end - 1])) end -= 1;
+        const file = await Filesystem.writeFile({
+          path: filename,
+          data: response.value.slice(offset, end),
+          directory: Directory.Cache,
+          encoding: Encoding.UTF8,
+        });
+        offset = end;
+        try {
+          while (offset < response.value.length) {
+            end = Math.min(offset + backupChunkSize, response.value.length);
+            if (end < response.value.length && /[\uD800-\uDBFF]/.test(response.value[end - 1])) end -= 1;
+            await Filesystem.appendFile({
+              path: filename,
+              data: response.value.slice(offset, end),
+              directory: Directory.Cache,
+              encoding: Encoding.UTF8,
+            });
+            offset = end;
+          }
+        } catch (error) {
+          try {
+            await Filesystem.deleteFile({ path: filename, directory: Directory.Cache });
+          } catch (cleanupError) {
+            console.error('Could not remove an incomplete backup file.', cleanupError);
+          }
+          throw error;
+        }
+        await Share.share({
+          title: 'Quiet Notes backup',
+          text: 'Quiet Notes backup (JSON)',
+          url: file.uri,
+          dialogTitle: 'Save Quiet Notes backup',
+        });
+        setBackupStatus({
+          kind: 'success',
+          text: `Backup file created. Choose a destination in the Android share sheet to save a copy (${storedNotes.length} ${storedNotes.length === 1 ? 'note' : 'notes'}).`,
+        });
+        return;
+      }
+
       const blob = new Blob([response.value], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
+      if (!('download' in link)) throw new Error('This browser does not support downloading backup files.');
       link.href = url;
-      link.download = `quiet-notes-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      link.download = filename;
       document.body.append(link);
       link.click();
       link.remove();
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-      setBackupStatus({ kind: 'success', text: `Backup exported with ${storedNotes.length} ${storedNotes.length === 1 ? 'note' : 'notes'}.` });
+      setBackupStatus({ kind: 'success', text: `Backup download requested with ${storedNotes.length} ${storedNotes.length === 1 ? 'note' : 'notes'}. Check your downloads for the file.` });
     } catch (error) {
       setBackupStatus({
         kind: 'error',
@@ -591,6 +725,23 @@ function AppSurface() {
         </div>
       )}
 
+      {pendingFlagSaves.some(pending => pending.status === 'error') && (
+        <div className="fixed top-0 z-30 flex w-full flex-col border-b border-[#5a342c] bg-[#21110e] text-sm text-[#e7c5b8]" role="alert" aria-live="polite">
+          {pendingFlagSaves.filter(pending => pending.status === 'error').map(pending => {
+            const noteName = pending.note.title.trim() || kindNames[pending.note.kind];
+            const changeName = Object.keys(pending.flags)
+              .map(flag => flag === 'pinned' ? 'pin' : 'favorite')
+              .join(' and ');
+            return (
+              <div key={pending.note.id} className="flex items-center justify-between gap-4 px-5 py-3" data-testid={`status-flag-save-${pending.note.id}`}>
+                <span>{changeName} change for “{noteName}” could not be saved: {pending.error} This change is only in memory and may be lost if the app closes.</span>
+                <button className="control-focus rounded px-2 py-1 text-xs underline underline-offset-4" onClick={() => void retryPendingFlagSave(pending.note.id)} data-testid={`button-retry-flag-save-${pending.note.id}`}>Retry</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {screen === 'home' && (
         <HomeScreen
           notes={filteredNotes}
@@ -602,8 +753,10 @@ function AppSurface() {
           onRetry={() => void refreshNotes()}
           onCreate={() => setKindMenu(value => !value)}
           onLibrary={() => { setKindMenu(false); setScreen('library'); }}
-          onOpen={note => void openNote(note)}
+          onOpen={note => { returnScreenRef.current = 'home'; void openNote(note); }}
           onDelete={note => void deleteNote(note)}
+          onPin={note => void toggleNoteFlag(note, 'pinned')}
+          onFavorite={note => void toggleNoteFlag(note, 'favorite')}
           kindMenu={kindMenu}
           onPickKind={kind => void createNote(kind)}
           onSettings={() => { setKindMenu(false); setScreen('settings'); }}
@@ -618,15 +771,19 @@ function AppSurface() {
           search={librarySearch}
           onSearch={setLibrarySearch}
           kind={libraryKind}
-          onKindChange={kind => { setLibraryKind(kind); setLibraryTag(null); setTaskFilter('all'); }}
+          onKindChange={kind => { setLibraryKind(kind); setLibraryFavoritesOnly(false); setLibraryTag(null); setTaskFilter('all'); }}
+          favoritesOnly={libraryFavoritesOnly}
+          onFavoritesOnlyChange={setLibraryFavoritesOnly}
           tag={libraryTag}
           onTagChange={setLibraryTag}
           taskFilter={taskFilter}
           onTaskFilterChange={setTaskFilter}
           onRetry={() => void refreshNotes()}
           onBack={() => setScreen('home')}
-          onOpen={note => void openNote(note)}
+          onOpen={note => { returnScreenRef.current = 'library'; void openNote(note); }}
           onDelete={note => void deleteNote(note)}
+          onPin={note => void toggleNoteFlag(note, 'pinned')}
+          onFavorite={note => void toggleNoteFlag(note, 'favorite')}
         />
       )}
 
@@ -638,10 +795,11 @@ function AppSurface() {
           saveState={saveState}
           saveMessage={saveMessage}
           onSave={updated => void persistNote(updated)}
-          onBack={() => { setEditorSettingsOpen(false); setScreen('home'); setKindMenu(false); }}
+          onBack={() => { setEditorSettingsOpen(false); setScreen(returnScreenRef.current); setKindMenu(false); }}
           onDelete={() => void deleteNote(activeNote)}
           onSaveMessage={setSaveMessage}
           onSettings={() => setEditorSettingsOpen(true)}
+          onRegisterBackHandler={registerEditorBackHandler}
         />
       )}
 
@@ -702,6 +860,112 @@ function AppSurface() {
   );
 }
 
+function NoteListItem(props: {
+  note: QuietNote;
+  variant: 'home' | 'library';
+  testId: string;
+  detail?: ReactNode;
+  onOpen: (note: QuietNote) => void;
+  onDelete: (note: QuietNote) => void;
+  onPin: (note: QuietNote) => void;
+  onFavorite: (note: QuietNote) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const pressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pressStartRef = useRef<{ x: number; y: number } | null>(null);
+  const suppressClickRef = useRef(false);
+  const clearPress = () => {
+    if (pressTimerRef.current) clearTimeout(pressTimerRef.current);
+    pressTimerRef.current = null;
+  };
+  const startPress = (event: PointerEvent<HTMLButtonElement>) => {
+    if (event.pointerType !== 'touch' && event.pointerType !== 'pen') return;
+    pressStartRef.current = { x: event.clientX, y: event.clientY };
+    pressTimerRef.current = setTimeout(() => {
+      suppressClickRef.current = true;
+      setMenuOpen(true);
+    }, 550);
+  };
+  const movePress = (event: PointerEvent<HTMLButtonElement>) => {
+    const start = pressStartRef.current;
+    if (start && (Math.abs(event.clientX - start.x) > 10 || Math.abs(event.clientY - start.y) > 10)) {
+      clearPress();
+      pressStartRef.current = null;
+    }
+  };
+  const noteName = props.note.title.trim() || kindNames[props.note.kind];
+  const isHome = props.variant === 'home';
+  return (
+    <article
+      className={`group relative flex min-w-0 items-start gap-3 ${isHome ? 'py-5' : 'border-b border-[#191816] py-4'}`}
+      data-testid={props.testId}
+      onContextMenu={event => {
+        event.preventDefault();
+        setMenuOpen(true);
+      }}
+    >
+      <button
+        onPointerDown={startPress}
+        onPointerMove={movePress}
+        onPointerUp={() => { clearPress(); pressStartRef.current = null; }}
+        onPointerCancel={() => { clearPress(); pressStartRef.current = null; }}
+        onClick={() => {
+          if (suppressClickRef.current) {
+            suppressClickRef.current = false;
+            return;
+          }
+          props.onOpen(props.note);
+        }}
+        className="control-focus min-w-0 flex-1 text-left"
+        data-testid={isHome ? `button-open-note-${props.note.id}` : `button-library-open-${props.note.id}`}
+      >
+        <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+          <h2 className={`m-0 flex min-w-0 items-center gap-2 truncate font-serif font-normal text-[#d6d0c5] group-hover:text-[#eee7dc] ${isHome ? 'text-[19px]' : 'text-lg'}`}>
+            <span className="truncate">{noteName}</span>
+            {props.note.pinned && <Pin size={13} className="note-state-mark shrink-0 text-[#b6a27e]" aria-label="Pinned" />}
+            {props.note.favorite && <Star size={13} className="note-state-mark shrink-0 fill-[#b6a27e] text-[#b6a27e]" aria-label="Favorite" />}
+          </h2>
+          <span className="shrink-0 text-[11px] text-[#5f5c56]" data-testid={`text-updated-${props.note.id}`}>{formatDate(props.note.updatedAt)}</span>
+        </div>
+        <p className="mb-0 mt-1 truncate font-serif text-sm leading-relaxed text-[#74706a]" data-testid={`text-preview-${props.note.id}`}>{notePreview(props.note)}</p>
+        {props.detail && <div className="mt-2">{props.detail}</div>}
+      </button>
+      <div className="relative mt-1 shrink-0">
+        <button
+          type="button"
+          onClick={() => setMenuOpen(value => !value)}
+          className="control-focus grid h-9 w-9 place-items-center rounded-full text-[#777168] transition hover:bg-[#211f1a] hover:text-[#d5cbb8]"
+          aria-label={`Actions for ${noteName}`}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          data-testid={`button-note-actions-${props.note.id}`}
+        >
+          <MoreHorizontal size={17} />
+        </button>
+        {menuOpen && (
+          <div
+            role="menu"
+            onKeyDown={event => {
+              if (event.key === 'Escape') setMenuOpen(false);
+            }}
+            className="absolute right-0 top-10 z-20 min-w-44 rounded-xl border border-[#2d2b27] bg-[#11110f] p-1.5 shadow-xl soft-in"
+          >
+            <button role="menuitem" onClick={() => { props.onPin(props.note); setMenuOpen(false); }} className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3 text-left text-sm text-[#d8d2c7] hover:bg-[#211f1a]" data-testid={`button-pin-note-${props.note.id}`}>
+              <Pin size={15} />{props.note.pinned ? 'Unpin note' : 'Pin note'}
+            </button>
+            <button role="menuitem" onClick={() => { props.onFavorite(props.note); setMenuOpen(false); }} className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3 text-left text-sm text-[#d8d2c7] hover:bg-[#211f1a]" data-testid={`button-favorite-note-${props.note.id}`}>
+              <Star size={15} />{props.note.favorite ? 'Remove favorite' : 'Add favorite'}
+            </button>
+            <button role="menuitem" onClick={() => { setMenuOpen(false); props.onDelete(props.note); }} className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3 text-left text-sm text-[#c39a8a] hover:bg-[#211917]" data-testid={`button-delete-note-${props.note.id}`}>
+              <Trash2 size={15} />Delete note
+            </button>
+          </div>
+        )}
+      </div>
+    </article>
+  );
+}
+
 function HomeScreen(props: {
   notes: QuietNote[];
   totalNotes: number;
@@ -714,12 +978,14 @@ function HomeScreen(props: {
   onLibrary: () => void;
   onOpen: (note: QuietNote) => void;
   onDelete: (note: QuietNote) => void;
+  onPin: (note: QuietNote) => void;
+  onFavorite: (note: QuietNote) => void;
   kindMenu: boolean;
   onPickKind: (kind: NoteKind) => void;
   onSettings: () => void;
 }) {
   return (
-    <section className="mx-auto min-h-[100dvh] w-full max-w-[850px] px-6 pb-24 pt-[max(8vh,48px)] sm:px-10">
+    <section className="screen-enter mx-auto min-h-[100dvh] w-full max-w-[850px] px-6 pb-24 pt-[max(8vh,48px)] sm:px-10">
       <header className="mb-16 flex items-center justify-between">
         <p className="m-0 text-[11px] uppercase tracking-[.2em] text-[#66615a]" data-testid="text-page-date">{new Date().toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })}</p>
         <button onClick={props.onSettings} className="control-focus grid h-10 w-10 place-items-center rounded-full text-[#827f79] transition hover:bg-[#151412] hover:text-[#ded5c4]" aria-label="Settings" data-testid="button-open-settings">
@@ -783,18 +1049,16 @@ function HomeScreen(props: {
           </div>
         )}
         {!props.loading && !props.loadError && props.notes.map(note => (
-          <article key={note.id} className="group relative flex items-start gap-3 py-5" data-testid={`card-note-${note.id}`}>
-            <button onClick={() => props.onOpen(note)} className="control-focus min-w-0 flex-1 text-left" data-testid={`button-open-note-${note.id}`}>
-              <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-                <h2 className="m-0 truncate font-serif text-[19px] font-normal text-[#d6d0c5] group-hover:text-[#eee7dc]">{note.title.trim() || kindNames[note.kind]}</h2>
-                <span className="shrink-0 text-[11px] text-[#5f5c56]" data-testid={`text-updated-${note.id}`}>{formatDate(note.updatedAt)}</span>
-              </div>
-              <p className="m-0 truncate font-serif text-sm leading-relaxed text-[#74706a]" data-testid={`text-preview-${note.id}`}>{notePreview(note)}</p>
-            </button>
-            <button onClick={() => props.onDelete(note)} className="control-focus mt-1 grid h-8 w-8 shrink-0 place-items-center rounded-full text-[#57544e] opacity-0 transition hover:bg-[#211a18] hover:text-[#c38f7e] focus:opacity-100 group-hover:opacity-100" aria-label={`Delete ${note.title || kindNames[note.kind]}`} data-testid={`button-delete-note-${note.id}`}>
-              <Trash2 size={15} strokeWidth={1.6} />
-            </button>
-          </article>
+          <NoteListItem
+            key={note.id}
+            note={note}
+            variant="home"
+            testId={`card-note-${note.id}`}
+            onOpen={props.onOpen}
+            onDelete={props.onDelete}
+            onPin={props.onPin}
+            onFavorite={props.onFavorite}
+          />
         ))}
         {!props.loading && !props.loadError && props.notes.length === 0 && (
           <div className="py-12" data-testid="empty-notes">
@@ -816,6 +1080,8 @@ function LibraryScreen(props: {
   onSearch: (value: string) => void;
   kind: 'all' | NoteKind;
   onKindChange: (kind: 'all' | NoteKind) => void;
+  favoritesOnly: boolean;
+  onFavoritesOnlyChange: (value: boolean) => void;
   tag: string | null;
   onTagChange: (tag: string | null) => void;
   taskFilter: 'all' | 'open' | 'complete';
@@ -824,12 +1090,14 @@ function LibraryScreen(props: {
   onBack: () => void;
   onOpen: (note: QuietNote) => void;
   onDelete: (note: QuietNote) => void;
+  onPin: (note: QuietNote) => void;
+  onFavorite: (note: QuietNote) => void;
 }) {
   const query = props.search.trim().toLowerCase();
   const matchedNotes = props.notes.filter(note => {
     const matchesKind = props.kind === 'all' || note.kind === props.kind;
     const matchesQuery = !query || `${note.title} ${notePreview(note)} ${kindNames[note.kind]}`.toLowerCase().includes(query);
-    return matchesKind && matchesQuery;
+    return matchesKind && matchesQuery && (!props.favoritesOnly || note.favorite === true);
   });
   const notes = matchedNotes.filter(note => note.kind === 'note');
   const journals = matchedNotes.filter(note => note.kind === 'journal');
@@ -853,19 +1121,17 @@ function LibraryScreen(props: {
   const hasLibraryResults = filteredNotes.length + filteredJournals.length + filteredTasks.length + checklists.length > 0;
 
   const renderNote = (note: QuietNote, detail?: ReactNode) => (
-    <article key={note.id} className="group flex min-w-0 items-start gap-3 border-b border-[#191816] py-4" data-testid={`library-item-${note.id}`}>
-      <button onClick={() => props.onOpen(note)} className="control-focus min-w-0 flex-1 text-left" data-testid={`button-library-open-${note.id}`}>
-        <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-          <h3 className="m-0 min-w-0 truncate font-serif text-lg font-normal text-[#d6d0c5] group-hover:text-[#eee7dc]">{note.title.trim() || kindNames[note.kind]}</h3>
-          <span className="shrink-0 text-[11px] text-[#5f5c56]">{formatDate(note.updatedAt)}</span>
-        </div>
-        <p className="mb-0 mt-1 truncate font-serif text-sm leading-relaxed text-[#74706a]">{notePreview(note)}</p>
-        {detail && <div className="mt-2">{detail}</div>}
-      </button>
-      <button onClick={() => props.onDelete(note)} className="control-focus grid h-10 w-10 shrink-0 place-items-center rounded-full text-[#777168] transition hover:bg-[#211a18] hover:text-[#c38f7e]" aria-label={`Delete ${note.title || kindNames[note.kind]}`} data-testid={`button-library-delete-${note.id}`}>
-        <Trash2 size={15} strokeWidth={1.6} />
-      </button>
-    </article>
+    <NoteListItem
+      key={note.id}
+      note={note}
+      variant="library"
+      testId={`library-item-${note.id}`}
+      detail={detail}
+      onOpen={props.onOpen}
+      onDelete={props.onDelete}
+      onPin={props.onPin}
+      onFavorite={props.onFavorite}
+    />
   );
 
   const renderTaggedNotes = (items: QuietNote[], includeNotebookTags: boolean) => {
@@ -894,7 +1160,7 @@ function LibraryScreen(props: {
   };
 
   return (
-    <section className="mx-auto min-h-[100dvh] w-full max-w-[850px] px-5 pb-24 pt-5 sm:px-10 sm:pt-8" data-testid="screen-library">
+    <section className="screen-enter mx-auto min-h-[100dvh] w-full max-w-[850px] px-5 pb-24 pt-5 sm:px-10 sm:pt-8" data-testid="screen-library">
       <header className="flex items-center justify-between">
         <button onClick={props.onBack} className="control-focus flex min-h-10 items-center gap-2 rounded-full px-2 text-sm text-[#89847b] transition hover:text-[#e4dccf]" data-testid="button-library-back">
           <ArrowLeft size={17} strokeWidth={1.6} /><span>Home</span>
@@ -921,6 +1187,14 @@ function LibraryScreen(props: {
       </label>
 
       <nav className="-mx-1 mb-6 flex gap-1 overflow-x-auto pb-2" aria-label="Library categories" data-testid="library-categories">
+        <button
+          onClick={() => props.onFavoritesOnlyChange(!props.favoritesOnly)}
+          className={`control-focus inline-flex min-h-10 shrink-0 items-center gap-2 rounded-full border px-4 text-sm transition ${props.favoritesOnly ? 'border-[#81745c] bg-[#191711] text-[#dfd2ba]' : 'border-[#302e29] text-[#77736c] hover:border-[#625b4c]'}`}
+          aria-pressed={props.favoritesOnly}
+          data-testid="button-library-favorites"
+        >
+          <Star size={14} className={props.favoritesOnly ? 'fill-[#b6a27e]' : ''} />Favorites
+        </button>
         {(['all', 'note', 'journal', 'task', 'checklist'] as const).map(kind => (
           <button key={kind} onClick={() => props.onKindChange(kind)} className={`control-focus min-h-10 shrink-0 rounded-full border px-4 text-sm transition ${props.kind === kind ? 'border-[#81745c] bg-[#191711] text-[#dfd2ba]' : 'border-[#302e29] text-[#77736c] hover:border-[#625b4c]'}`} aria-pressed={props.kind === kind} data-testid={`button-library-kind-${kind}`}>
             {kind === 'all' ? 'All' : `${kindNames[kind]}s`}
@@ -999,6 +1273,7 @@ function NoteEditor(props: {
   onDelete: () => void;
   onSaveMessage: (message: string) => void;
   onSettings: () => void;
+  onRegisterBackHandler: (handler: (() => void) | null) => void;
 }) {
   const titleRef = useRef<HTMLInputElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -1217,12 +1492,19 @@ function NoteEditor(props: {
   };
 
   const saveStatus = props.saveState === 'saving' ? 'Saving…' : props.saveState === 'error' ? 'Not saved' : 'Saved on this device';
-  const leaveEditor = () => {
+  const leaveEditor = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current);
     if (props.saveState === 'error' && !window.confirm('This page has edits that did not save. Leave anyway?')) return;
     flushSave(title, bodyRef.current?.innerHTML ?? body);
     props.onBack();
-  };
+  }, [body, flushSave, props.onBack, props.saveState, title]);
+  const leaveEditorRef = useRef(leaveEditor);
+  leaveEditorRef.current = leaveEditor;
+
+  useEffect(() => {
+    props.onRegisterBackHandler(() => leaveEditorRef.current());
+    return () => props.onRegisterBackHandler(null);
+  }, [props.onRegisterBackHandler]);
   const removeCurrentPage = () => {
     if (timerRef.current) clearTimeout(timerRef.current);
     props.onDelete();
@@ -1235,7 +1517,7 @@ function NoteEditor(props: {
   };
 
   return (
-    <section className="mx-auto flex min-h-[100dvh] w-full max-w-[900px] flex-col px-5 pb-24 pt-5 sm:px-10 sm:pt-8" data-testid="screen-editor">
+    <section className="screen-enter mx-auto flex min-h-[100dvh] w-full max-w-[900px] flex-col px-5 pb-24 pt-5 sm:px-10 sm:pt-8" data-testid="screen-editor">
       <header className="flex min-h-11 items-center justify-between">
         <button onClick={leaveEditor} className="control-focus flex items-center gap-2 rounded-full px-2 py-2 text-sm text-[#89847b] transition hover:text-[#e4dccf]" data-testid="button-back-home">
           <ArrowLeft size={17} strokeWidth={1.6} /><span className="hidden sm:inline">All pages</span>
@@ -1463,7 +1745,7 @@ function SettingsScreen(props: {
 }) {
   const update = (partial: Partial<QuietSettings>) => props.onChange({ ...props.settings, ...partial });
   return (
-    <section className="mx-auto min-h-[100dvh] w-full max-w-[720px] px-6 pb-20 pt-6 sm:px-10 sm:pt-9" data-testid="screen-settings">
+    <section className="screen-enter mx-auto min-h-[100dvh] w-full max-w-[720px] px-6 pb-20 pt-6 sm:px-10 sm:pt-9" data-testid="screen-settings">
       <header className="flex items-center">
         <button onClick={props.onBack} className="control-focus flex items-center gap-2 rounded-full px-2 py-2 text-sm text-[#89847b] hover:text-[#e4dccf]" data-testid="button-settings-back"><ArrowLeft size={17} strokeWidth={1.6} /><span>Back</span></button>
       </header>
@@ -1503,9 +1785,11 @@ function SettingsScreen(props: {
         <section className="mt-12 border-t border-[#201f1c] pt-8" aria-labelledby="heading-task-reminders" data-testid="section-task-reminders">
           <h2 id="heading-task-reminders" className="m-0 text-sm font-medium text-[#d5cec2]">Task reminders</h2>
           <p className="mb-0 mt-2 max-w-lg text-xs leading-relaxed text-[#777168]">
-            {props.reminders.permission === 'granted'
-              ? 'Browser reminders require this tab to remain open. Closed-browser delivery needs a configured background notification service worker.'
-              : 'Allow notifications on this device to receive reminders for tasks with a reminder date and time.'}
+            {Capacitor.isNativePlatform()
+              ? 'Android schedules local notifications that can arrive while Quiet Notes is closed. Android may delay inexact reminders; exact-alarm access is not requested.'
+              : props.reminders.permission === 'granted'
+                ? 'Browser reminders require this tab to remain open. Closed-browser delivery needs a configured background notification service worker.'
+                : 'Allow notifications on this device to receive reminders for tasks with a reminder date and time.'}
           </p>
           <button
             type="button"

@@ -9,9 +9,9 @@ export type ImageOptions = {
 };
 
 export const defaultImageOptions: ImageOptions = {
-  size: 'medium',
-  alignment: 'center',
-  wrap: false,
+  size: 'small',
+  alignment: 'left',
+  wrap: true,
   caption: '',
 };
 

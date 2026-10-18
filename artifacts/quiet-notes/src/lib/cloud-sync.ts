@@ -15,6 +15,11 @@ import {
 } from 'firebase/storage';
 import type { QuietNote } from '../quiet-storage';
 import { quietStorage } from '../quiet-storage.ts';
+import {
+  noteFlagSaveCoordinator,
+  noteWithPendingFlags,
+  NoteFlagSaveCoordinator,
+} from './note-actions.ts';
 
 type CloudNote = {
   note: QuietNote;
@@ -45,6 +50,14 @@ export type SyncDecision = 'download' | 'upload' | 'same' | 'conflict' | 'none';
 
 const cloudImagePrefix = 'quiet-cloud-image:';
 export const cloudImageUploadTimeoutMs = 8_000;
+const maxDeviceConflictUploadAttempts = 4;
+
+export class NoteConflictResolutionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NoteConflictResolutionError';
+  }
+}
 
 export type PreparedCloudNote = {
   note: QuietNote;
@@ -110,6 +123,88 @@ export function decideNoteSync(
   if (localChanged) return 'upload';
   if (cloudChanged) return 'download';
   return 'none';
+}
+
+export function decidePendingNoteSync(
+  local: QuietNote,
+  cloud: QuietNote | undefined,
+  baseUpdatedAt: number | undefined,
+  pending: NonNullable<ReturnType<typeof noteFlagSaveCoordinator.getPendingSave>>,
+): { localNote: QuietNote; decision: SyncDecision } {
+  const localNote = noteWithPendingFlags(local, pending);
+  return {
+    localNote,
+    decision: decideNoteSync(localNote, cloud, baseUpdatedAt),
+  };
+}
+
+export async function uploadLatestDeviceConflictVersion(
+  noteId: string,
+  initialCoordinatorRevision: number,
+  expectedRemoteUpdatedAt: number,
+  coordinator: NoteFlagSaveCoordinator,
+  getLocalNote: (id: string) => Promise<QuietNote | undefined>,
+  writeCloudVersion: (
+    note: QuietNote,
+    expectedRemoteUpdatedAt: number,
+    coordinatorRevision: number,
+  ) => Promise<boolean>,
+): Promise<QuietNote> {
+  let expectedRemote = expectedRemoteUpdatedAt;
+  let revision = initialCoordinatorRevision;
+  let uploadedNote: QuietNote | undefined;
+
+  for (let attempt = 0; attempt < maxDeviceConflictUploadAttempts; attempt += 1) {
+    const revisionBeforeRead = coordinator.getRevision(noteId);
+    if (!uploadedNote && revisionBeforeRead !== initialCoordinatorRevision) {
+      throw new NoteConflictResolutionError('This note changed while the conflict was open. Sync again and resolve the conflict using the current versions.');
+    }
+
+    const latestLocal = await getLocalNote(noteId);
+    if (!latestLocal) {
+      throw new NoteConflictResolutionError('This note is no longer available on this device. Sync again before resolving the conflict.');
+    }
+    const revisionAfterRead = coordinator.getRevision(noteId);
+    if (revisionAfterRead !== revisionBeforeRead) {
+      if (!uploadedNote) {
+        throw new NoteConflictResolutionError('This note changed while the conflict was open. Sync again and resolve the conflict using the current versions.');
+      }
+      revision = revisionAfterRead;
+      continue;
+    }
+    if (revisionAfterRead !== revision) {
+      throw new NoteConflictResolutionError('This note changed while the conflict was open. Sync again and resolve the conflict using the current versions.');
+    }
+
+    const pending = coordinator.getPendingSave(noteId);
+    const currentNote = pending ? noteWithPendingFlags(latestLocal, pending) : latestLocal;
+    if (uploadedNote && JSON.stringify(currentNote) === JSON.stringify(uploadedNote)) return uploadedNote;
+
+    if (!await writeCloudVersion(currentNote, expectedRemote, revision)) {
+      throw new NoteConflictResolutionError('The cloud version changed while this conflict was being resolved. Sync again and resolve the latest versions.');
+    }
+    uploadedNote = currentNote;
+    expectedRemote = currentNote.updatedAt;
+
+    const revisionAfterUpload = coordinator.getRevision(noteId);
+    const localAfterUpload = await getLocalNote(noteId);
+    if (!localAfterUpload) {
+      throw new NoteConflictResolutionError('This note is no longer available on this device. Sync again before resolving the conflict.');
+    }
+    const revisionAfterVerification = coordinator.getRevision(noteId);
+    if (revisionAfterVerification !== revisionAfterUpload) {
+      revision = revisionAfterVerification;
+      continue;
+    }
+    const pendingAfterUpload = coordinator.getPendingSave(noteId);
+    const latestAfterUpload = pendingAfterUpload
+      ? noteWithPendingFlags(localAfterUpload, pendingAfterUpload)
+      : localAfterUpload;
+    if (JSON.stringify(latestAfterUpload) === JSON.stringify(uploadedNote)) return uploadedNote;
+    revision = revisionAfterVerification;
+  }
+
+  throw new NoteConflictResolutionError('This note kept changing while its conflict was being resolved. Sync again and resolve the conflict using the current versions.');
 }
 
 function pathNoteId(noteId: string): string {
@@ -418,6 +513,23 @@ export async function syncUserNotes(
       () => quietStorage.getSyncBase(uid, localNote.id),
       reportStage,
     );
+    const pendingFlags = noteFlagSaveCoordinator.getPendingSave(localNote.id);
+    if (pendingFlags) {
+      const { localNote: effectiveLocalNote, decision } = decidePendingNoteSync(
+        localNote,
+        cloudNote,
+        baseUpdatedAt,
+        pendingFlags,
+      );
+      if (decision === 'conflict' && cloudNote) {
+        result.conflicts.push({
+          id: localNote.id,
+          localNote: effectiveLocalNote,
+          cloudNote: await hydrateCloudNote(cloudNote),
+        });
+      }
+      continue;
+    }
     if (cloudNote && baseUpdatedAt === undefined) {
       cloudNote = await hydrateCloudNote(cloudNote);
       cloudNotes.set(localNote.id, cloudNote);
@@ -463,7 +575,12 @@ export async function syncUserNotes(
         );
         result.downloaded += 1;
       } else {
-        result.conflicts.push({ id: localNote.id, localNote, cloudNote: hydrated });
+        const pending = noteFlagSaveCoordinator.getPendingSave(localNote.id);
+        result.conflicts.push({
+          id: localNote.id,
+          localNote: pending ? noteWithPendingFlags(localNote, pending) : localNote,
+          cloudNote: hydrated,
+        });
       }
     } else if (decision === 'same' && cloudNote) {
       const prepared = await noteForCloud(localNote, uid, activeStorage, reportStage, cloudNote);
@@ -529,6 +646,7 @@ export async function resolveNoteConflict(
   db: Firestore,
   storage: FirebaseStorage | undefined,
 ): Promise<ImageSyncFailure[]> {
+  const expectedFlagRevision = noteFlagSaveCoordinator.getRevision(conflict.id);
   const selected = choice === 'device' ? conflict.localNote : conflict.cloudNote;
   const expectedRemote = conflict.cloudNote.updatedAt;
   if (!selected) {
@@ -539,9 +657,54 @@ export async function resolveNoteConflict(
     await quietStorage.clearSyncBase(uid, conflict.id);
     return [];
   }
+  let resolvedUpdatedAt = selected.updatedAt;
+  if (choice === 'device') {
+    let activeStorage = storage;
+    const imageFailures: ImageSyncFailure[] = [];
+    const resolvedNote = await uploadLatestDeviceConflictVersion(
+      conflict.id,
+      expectedFlagRevision,
+      expectedRemote,
+      noteFlagSaveCoordinator,
+      noteId => quietStorage.getNote(noteId),
+      async (currentNote, expectedCloudRevision, expectedCoordinatorRevision) => {
+        const currentPrepared = await noteForCloud(currentNote, uid, activeStorage);
+        imageFailures.push(...currentPrepared.imageFailures);
+        if (currentPrepared.storageUnavailable) activeStorage = undefined;
+        if (noteFlagSaveCoordinator.getRevision(conflict.id) !== expectedCoordinatorRevision) {
+          throw new NoteConflictResolutionError('This note changed while the conflict was being resolved. Sync again and resolve it using the current versions.');
+        }
+        const latestLocal = await quietStorage.getNote(conflict.id);
+        if (!latestLocal) {
+          throw new NoteConflictResolutionError('This note is no longer available on this device. Sync again before resolving the conflict.');
+        }
+        const latestPending = noteFlagSaveCoordinator.getPendingSave(conflict.id);
+        const latestSnapshot = latestPending ? noteWithPendingFlags(latestLocal, latestPending) : latestLocal;
+        if (
+          noteFlagSaveCoordinator.getRevision(conflict.id) !== expectedCoordinatorRevision
+          || JSON.stringify(latestSnapshot) !== JSON.stringify(currentNote)
+        ) {
+          throw new NoteConflictResolutionError('This note changed while the conflict was being resolved. Sync again and resolve it using the current versions.');
+        }
+        return writeCloudNote(
+          db,
+          uid,
+          currentNote,
+          expectedCloudRevision,
+          activeStorage,
+          undefined,
+          currentPrepared.note,
+        );
+      },
+    );
+    resolvedUpdatedAt = resolvedNote.updatedAt;
+    await quietStorage.setSyncBase(uid, conflict.id, resolvedUpdatedAt);
+    return imageFailures;
+  }
+
   const prepared = await noteForCloud(selected, uid, storage);
   const saved = await writeCloudNote(db, uid, selected, expectedRemote, storage, undefined, prepared.note);
-  if (!saved) throw new Error('The cloud version changed since this conflict was shown. Sync again to review the latest version.');
+  if (!saved) throw new NoteConflictResolutionError('The cloud version changed while this conflict was being resolved. Sync again and resolve the latest versions.');
   if (choice === 'cloud') {
     const restoredCloudNote = await noteFromCloud(
       conflict.cloudNote,
@@ -550,10 +713,16 @@ export async function resolveNoteConflict(
       undefined,
       failure => prepared.imageFailures.push(failure),
     );
-    const applied = await quietStorage.applyRemoteNote(restoredCloudNote, conflict.localNote?.updatedAt);
+    const currentLocal = await quietStorage.getNote(conflict.id);
+    const applied = await quietStorage.applyRemoteNote(
+      restoredCloudNote,
+      currentLocal?.updatedAt,
+      { allowPendingFlagSave: true, expectedFlagRevision },
+    );
     if (!applied) throw new Error('This device note changed while the conflict was being resolved. Sync again to avoid losing that edit.');
+    noteFlagSaveCoordinator.clear(conflict.id, expectedFlagRevision);
     await quietStorage.clearNoteDeletedForSync(uid, conflict.id);
   }
-  await quietStorage.setSyncBase(uid, conflict.id, selected.updatedAt);
+  await quietStorage.setSyncBase(uid, conflict.id, resolvedUpdatedAt);
   return prepared.imageFailures;
 }

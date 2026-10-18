@@ -94,6 +94,8 @@ function validNote(value: unknown): value is QuietNote {
     && typeof value.createdAt === 'number' && Number.isFinite(value.createdAt) && value.createdAt >= 0
     && typeof value.updatedAt === 'number' && Number.isFinite(value.updatedAt) && value.updatedAt >= 0
     && typeof value.recentlyOpenedAt === 'number' && Number.isFinite(value.recentlyOpenedAt) && value.recentlyOpenedAt >= 0
+    && (value.pinned === undefined || typeof value.pinned === 'boolean')
+    && (value.favorite === undefined || typeof value.favorite === 'boolean')
     && (value.kind === 'task' || !hasTaskSchedule)
     && (value.dueDate === undefined || (typeof value.dueDate === 'string' && validDateOnly(value.dueDate)))
     && (value.reminderAt === undefined || (typeof value.reminderAt === 'number' && Number.isFinite(value.reminderAt) && value.reminderAt >= 0))

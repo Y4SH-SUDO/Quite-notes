@@ -2,12 +2,16 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   CloudSyncStageError,
+  NoteConflictResolutionError,
   cloudImageUploadTimeoutMs,
+  decidePendingNoteSync,
   decideNoteSync,
   noteForCloud,
+  uploadLatestDeviceConflictVersion,
   waitForImageUpload,
 } from './cloud-sync.ts';
 import type { QuietNote } from '../quiet-storage.ts';
+import { NoteFlagSaveCoordinator } from './note-actions.ts';
 
 const note: QuietNote = {
   id: 'sync-task',
@@ -35,6 +39,125 @@ test('sync detects concurrent changes from their last shared revision', () => {
   assert.equal(decideNoteSync(local, note, note.updatedAt), 'upload');
   assert.equal(decideNoteSync(note, cloud, note.updatedAt), 'download');
   assert.equal(decideNoteSync(note, note, note.updatedAt), 'none');
+});
+
+test('pin and favorite updates remain in the synchronized note and are conflict-aware', async () => {
+  const original = { ...note, pinned: false, favorite: false };
+  const updated = { ...original, pinned: true, favorite: true, updatedAt: note.updatedAt + 1 };
+  const prepared = await noteForCloud(updated, 'account-id', undefined);
+
+  assert.deepEqual(prepared.note, updated);
+  assert.equal(decideNoteSync(updated, original, original.updatedAt), 'upload');
+  assert.equal(decideNoteSync(updated, { ...original, updatedAt: original.updatedAt + 1 }, original.updatedAt), 'conflict');
+});
+
+test('a pending pin or favorite conflicts with a newer cloud revision instead of downloading over it', async () => {
+  for (const flag of ['pinned', 'favorite'] as const) {
+    const coordinator = new NoteFlagSaveCoordinator();
+    const local = { ...note, pinned: false, favorite: false };
+    const intended = { ...local, [flag]: true, updatedAt: note.updatedAt + 1 };
+    await coordinator.save(intended, flag, async () => {
+      throw new Error('The local flag save failed.');
+    });
+    const remote = { ...local, [flag]: false, updatedAt: note.updatedAt + 2 };
+    const pending = coordinator.getPendingSave(note.id);
+    assert.ok(pending);
+
+    const result = decidePendingNoteSync(local, remote, note.updatedAt, pending);
+
+    assert.equal(result.decision, 'conflict');
+    assert.equal(result.localNote[flag], true);
+    assert.equal(coordinator.hasPending(note.id), true);
+  }
+});
+
+test('a remote change to another flag preserves independent pending local intent', async () => {
+  const coordinator = new NoteFlagSaveCoordinator();
+  const local = { ...note, pinned: false, favorite: false };
+  await coordinator.save(
+    { ...local, favorite: true, updatedAt: note.updatedAt + 1 },
+    'favorite',
+    async () => { throw new Error('The local favorite save failed.'); },
+  );
+  const pending = coordinator.getPendingSave(note.id);
+  assert.ok(pending);
+
+  const result = decidePendingNoteSync(
+    local,
+    { ...local, pinned: true, updatedAt: note.updatedAt + 2 },
+    note.updatedAt,
+    pending,
+  );
+
+  assert.equal(result.decision, 'conflict');
+  assert.equal(result.localNote.favorite, true);
+  assert.equal(result.localNote.pinned, false);
+  assert.equal(coordinator.getPendingSave(note.id)?.flags.favorite, true);
+});
+
+test('device conflict resolution rejects a coordinator revision change before upload', async () => {
+  for (const flag of ['pinned', 'favorite'] as const) {
+    const coordinator = new NoteFlagSaveCoordinator();
+    let local = { ...note, pinned: false, favorite: false };
+    let writes = 0;
+
+    await assert.rejects(
+      uploadLatestDeviceConflictVersion(
+        note.id,
+        coordinator.getRevision(note.id),
+        30,
+        coordinator,
+        async () => {
+          await coordinator.save(
+            { ...local, [flag]: true, updatedAt: 21 },
+            flag,
+            async () => { throw new Error('Local save is pending.'); },
+          );
+          return local;
+        },
+        async () => { writes += 1; return true; },
+      ),
+      NoteConflictResolutionError,
+    );
+
+    assert.equal(writes, 0);
+    assert.equal(coordinator.getPendingSave(note.id)?.flags[flag], true);
+  }
+});
+
+test('device conflict resolution reconciles flag changes made during upload with Firestore CAS', async () => {
+  for (const flag of ['pinned', 'favorite'] as const) {
+    const coordinator = new NoteFlagSaveCoordinator();
+    const local = { ...note, pinned: false, favorite: false };
+    const intended = { ...local, [flag]: true, updatedAt: 21 };
+    const writes: Array<{ note: QuietNote; expectedRemoteUpdatedAt: number }> = [];
+
+    const resolved = await uploadLatestDeviceConflictVersion(
+      note.id,
+      coordinator.getRevision(note.id),
+      30,
+      coordinator,
+      async () => local,
+      async (uploaded, expectedRemoteUpdatedAt) => {
+        writes.push({ note: uploaded, expectedRemoteUpdatedAt });
+        if (writes.length === 1) {
+          await coordinator.save(
+            intended,
+            flag,
+            async () => { throw new Error('Local save is pending.'); },
+          );
+        }
+        return true;
+      },
+    );
+
+    assert.equal(writes.length, 2);
+    assert.equal(writes[0].note[flag], false);
+    assert.equal(writes[0].expectedRemoteUpdatedAt, 30);
+    assert.equal(writes[1].note[flag], true);
+    assert.equal(writes[1].expectedRemoteUpdatedAt, writes[0].note.updatedAt);
+    assert.equal(resolved[flag], true);
+  }
 });
 
 test('first-sync ID collisions are conflicts unless contents clearly match', () => {

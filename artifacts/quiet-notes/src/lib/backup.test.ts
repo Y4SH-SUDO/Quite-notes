@@ -5,7 +5,8 @@ import {
   parseBackupText,
   planBackupImport,
 } from './backup.ts';
-import type { QuietNote, QuietSettings } from '../quiet-storage.ts';
+import { sortNotes, type QuietNote, type QuietSettings } from '../quiet-storage.ts';
+import { defaultImageOptions } from './editor-dom.ts';
 
 const settings: QuietSettings = {
   fontFamily: 'Georgia',
@@ -18,10 +19,12 @@ const notes: QuietNote[] = [
     id: 'note-1',
     title: 'A #Travel note',
     kind: 'note',
-    content: '<p>#Weekend</p><figure data-note-image=""><img src="data:image/png;base64,aGVsbG8=" alt="image"><figcaption>Photo</figcaption></figure>',
+    content: '<p>#Weekend</p><figure data-note-image="" data-size="small" data-align="left" data-wrap="false"><img src="data:image/png;base64,aGVsbG8=" alt="image"><figcaption>Photo</figcaption></figure>',
     createdAt: 100,
     updatedAt: 200,
     recentlyOpenedAt: 300,
+    pinned: true,
+    favorite: true,
   },
   {
     id: 'task-1',
@@ -64,6 +67,7 @@ test('backup round-trip preserves note kinds, IDs, timestamps, content, images, 
   assert.equal(restored.exportedAt, 1234);
   assert.deepEqual(restored.tags, ['Travel', 'Weekend'].map(tag => tag.toLowerCase()));
   assert.match(restored.notes[0].content, /data:image\/png;base64,aGVsbG8=/);
+  assert.match(restored.notes[0].content, /data-wrap="false"/);
   assert.deepEqual(restored.notes.map(note => note.kind), ['note', 'task', 'journal', 'checklist']);
   assert.equal(restored.notes[1].dueDate, '2026-10-20');
   assert.equal(restored.notes[1].reminderAt, 1792512000000);
@@ -104,6 +108,31 @@ test('existing legacy note records can be backed up without adding or changing f
 
   assert.deepEqual(restored.notes[0], originalRecord);
   assert.deepEqual(existingRecord, originalRecord);
+});
+
+test('backup validation preserves separate pin and favorite values', () => {
+  const backup = createBackup([
+    { ...notes[0], pinned: false, favorite: true },
+    { ...notes[1], pinned: true, favorite: false },
+  ], settings);
+  const restored = parseBackupText(JSON.stringify(backup));
+
+  assert.equal(restored.notes[0].pinned, false);
+  assert.equal(restored.notes[0].favorite, true);
+  assert.equal(restored.notes[1].pinned, true);
+  assert.equal(restored.notes[1].favorite, false);
+});
+
+test('pins sort before other notes while preserving recency inside each group', () => {
+  const sorted = sortNotes([
+    { ...notes[0], pinned: false, recentlyOpenedAt: 300 },
+    { ...notes[1], pinned: true, recentlyOpenedAt: 200 },
+    { ...notes[2], pinned: true, recentlyOpenedAt: 400 },
+  ]);
+
+  assert.deepEqual(sorted.map(note => note.id), ['journal-1', 'task-1', 'note-1']);
+  assert.equal(defaultImageOptions.wrap, true);
+  assert.equal(defaultImageOptions.alignment, 'left');
 });
 
 test('malformed JSON and invalid backup shapes are rejected', () => {

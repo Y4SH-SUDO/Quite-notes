@@ -1,4 +1,5 @@
 import { planBackupImport, type ImportStrategy } from './lib/backup.ts';
+import { noteFlagSaveCoordinator, noteWriteQueue, type NoteFlagValues } from './lib/note-actions.ts';
 
 export type NoteKind = 'note' | 'task' | 'journal' | 'checklist';
 
@@ -10,6 +11,8 @@ export type QuietNote = {
   createdAt: number;
   updatedAt: number;
   recentlyOpenedAt: number;
+  pinned?: boolean;
+  favorite?: boolean;
   dueDate?: string;
   reminderAt?: number;
   reminderTimezone?: string;
@@ -84,8 +87,97 @@ async function withStore<T>(
 export const quietStorage = {
   listNotes: () => withStore<QuietNote[]>('notes', 'readonly', store => store.getAll()),
   getNote: (id: string) => withStore<QuietNote | undefined>('notes', 'readonly', store => store.get(id)),
-  saveNote: (note: QuietNote) => withStore<IDBValidKey>('notes', 'readwrite', store => store.put(note)),
-  deleteNote: (id: string) => withStore<undefined>('notes', 'readwrite', store => store.delete(id)),
+  saveNote(note: QuietNote) {
+    return noteWriteQueue.run(note.id, async () => {
+      const db = await openDatabase();
+      try {
+        return await new Promise<IDBValidKey>((resolve, reject) => {
+          const transaction = db.transaction(NOTES_STORE, 'readwrite');
+          const store = transaction.objectStore(NOTES_STORE);
+          let savedKey: IDBValidKey | undefined;
+          let failure: Error | undefined;
+          transaction.oncomplete = () => {
+            if (failure) reject(failure);
+            else if (savedKey !== undefined) resolve(savedKey);
+            else reject(new Error('The note save finished without a result.'));
+          };
+          transaction.onerror = () => reject(transaction.error ?? new Error('The note could not be saved.'));
+          transaction.onabort = () => reject(failure ?? transaction.error ?? new Error('The note save was interrupted.'));
+
+          const request = store.get(note.id);
+          request.onerror = () => {
+            failure = request.error ?? new Error('The existing note could not be read before saving.');
+            transaction.abort();
+          };
+          request.onsuccess = () => {
+            const existing = request.result as QuietNote | undefined;
+            const next = {
+              ...note,
+              ...(existing?.pinned === undefined ? {} : { pinned: existing.pinned }),
+              ...(existing?.favorite === undefined ? {} : { favorite: existing.favorite }),
+            };
+            const put = store.put(next);
+            put.onsuccess = () => { savedKey = put.result; };
+            put.onerror = () => {
+              failure = put.error ?? new Error('The note could not be saved.');
+              transaction.abort();
+            };
+          };
+        });
+      } finally {
+        db.close();
+      }
+    });
+  },
+  saveNoteFlags(noteId: string, flags: NoteFlagValues) {
+    return noteWriteQueue.run(noteId, async () => {
+      const db = await openDatabase();
+      try {
+        return await new Promise<QuietNote>((resolve, reject) => {
+          const transaction = db.transaction(NOTES_STORE, 'readwrite');
+          const store = transaction.objectStore(NOTES_STORE);
+          let savedNote: QuietNote | undefined;
+          let failure: Error | undefined;
+          transaction.oncomplete = () => {
+            if (failure) reject(failure);
+            else if (savedNote) resolve(savedNote);
+            else reject(new Error('The note flag save finished without a result.'));
+          };
+          transaction.onerror = () => reject(transaction.error ?? new Error('The note flags could not be saved.'));
+          transaction.onabort = () => reject(failure ?? transaction.error ?? new Error('The note flags save was interrupted.'));
+
+          const request = store.get(noteId);
+          request.onerror = () => {
+            failure = request.error ?? new Error('The note could not be read before updating its flags.');
+            transaction.abort();
+          };
+          request.onsuccess = () => {
+            const existing = request.result as QuietNote | undefined;
+            if (!existing) {
+              failure = new Error('The note no longer exists on this device.');
+              transaction.abort();
+              return;
+            }
+            savedNote = {
+              ...existing,
+              ...flags,
+              updatedAt: Math.max(Date.now(), existing.updatedAt + 1),
+            };
+            const put = store.put(savedNote);
+            put.onerror = () => {
+              failure = put.error ?? new Error('The note flags could not be saved.');
+              transaction.abort();
+            };
+          };
+        });
+      } finally {
+        db.close();
+      }
+    });
+  },
+  deleteNote(id: string) {
+    return noteWriteQueue.run(id, () => withStore<undefined>('notes', 'readwrite', store => store.delete(id)));
+  },
   async getSettings(): Promise<QuietSettings | undefined> {
     const saved = await withStore<{ key: string; value: QuietSettings } | undefined>(
       SETTINGS_STORE, 'readonly', store => store.get('preferences'),
@@ -132,35 +224,46 @@ export const quietStorage = {
       store => store.delete(`sync-base:${uid}:${noteId}`),
     );
   },
-  async applyRemoteNote(note: QuietNote, expectedLocalUpdatedAt?: number): Promise<boolean> {
-    const db = await openDatabase();
-    try {
-      return await new Promise<boolean>((resolve, reject) => {
-        const transaction = db.transaction(NOTES_STORE, 'readwrite');
-        const store = transaction.objectStore(NOTES_STORE);
-        let applied = false;
-        transaction.oncomplete = () => resolve(applied);
-        transaction.onerror = () => reject(transaction.error ?? new Error('The synced note could not be saved.'));
-        transaction.onabort = () => reject(transaction.error ?? new Error('The synced note update was interrupted.'));
+  async applyRemoteNote(
+    note: QuietNote,
+    expectedLocalUpdatedAt?: number,
+    options: { allowPendingFlagSave?: boolean; expectedFlagRevision?: number } = {},
+  ): Promise<boolean> {
+    return noteWriteQueue.run(note.id, async () => {
+      const db = await openDatabase();
+      try {
+        return await new Promise<boolean>((resolve, reject) => {
+          const transaction = db.transaction(NOTES_STORE, 'readwrite');
+          const store = transaction.objectStore(NOTES_STORE);
+          let applied = false;
+          transaction.oncomplete = () => resolve(applied);
+          transaction.onerror = () => reject(transaction.error ?? new Error('The synced note could not be saved.'));
+          transaction.onabort = () => reject(transaction.error ?? new Error('The synced note update was interrupted.'));
 
-        const request = store.get(note.id);
-        request.onerror = () => transaction.abort();
-        request.onsuccess = () => {
-          const existing = request.result as QuietNote | undefined;
-          if (expectedLocalUpdatedAt === undefined) {
-            if (existing) return;
-            store.add(note);
+          const request = store.get(note.id);
+          request.onerror = () => transaction.abort();
+          request.onsuccess = () => {
+            if (!noteFlagSaveCoordinator.canApplyRemote(
+              note.id,
+              options.allowPendingFlagSave === true,
+              options.expectedFlagRevision,
+            )) return;
+            const existing = request.result as QuietNote | undefined;
+            if (expectedLocalUpdatedAt === undefined) {
+              if (existing) return;
+              store.add(note);
+              applied = true;
+              return;
+            }
+            if (!existing || existing.updatedAt !== expectedLocalUpdatedAt) return;
+            store.put(note);
             applied = true;
-            return;
-          }
-          if (!existing || existing.updatedAt !== expectedLocalUpdatedAt) return;
-          store.put(note);
-          applied = true;
-        };
-      });
-    } finally {
-      db.close();
-    }
+          };
+        });
+      } finally {
+        db.close();
+      }
+    });
   },
   async importBackup(
     notes: QuietNote[],
@@ -253,4 +356,11 @@ export function newNote(kind: NoteKind): QuietNote {
     updatedAt: now,
     recentlyOpenedAt: now,
   };
+}
+
+export function sortNotes(notes: QuietNote[]): QuietNote[] {
+  return [...notes].sort((left, right) =>
+    Number(right.pinned === true) - Number(left.pinned === true)
+    || right.recentlyOpenedAt - left.recentlyOpenedAt,
+  );
 }
