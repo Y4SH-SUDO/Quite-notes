@@ -7,6 +7,7 @@ import {
 } from './backup.ts';
 import { sortNotes, type QuietNote, type QuietSettings } from '../quiet-storage.ts';
 import { defaultImageOptions } from './editor-dom.ts';
+import { createHandwritingPage } from './handwriting.ts';
 
 const settings: QuietSettings = {
   fontFamily: 'Georgia',
@@ -121,6 +122,22 @@ test('backup validation preserves separate pin and favorite values', () => {
   assert.equal(restored.notes[0].favorite, true);
   assert.equal(restored.notes[1].pinned, true);
   assert.equal(restored.notes[1].favorite, false);
+});
+
+test('handwriting vector data round-trips in version 2 backups', () => {
+  const page = createHandwritingPage();
+  page.strokes.push({
+    color: '#d8d0c3',
+    width: 5,
+    points: [{ x: 0.3, y: 0.4, pressure: 0.5, time: 12 }],
+  });
+  const handwritten = { ...notes[0], handwriting: [page] };
+  const backup = createBackup([handwritten], settings);
+  const restored = parseBackupText(JSON.stringify(backup));
+
+  assert.equal(backup.schemaVersion, 2);
+  assert.deepEqual(restored.notes[0].handwriting, [page]);
+  assert.deepEqual(restored.library, []);
 });
 
 test('pins sort before other notes while preserving recency inside each group', () => {

@@ -13,8 +13,10 @@ self.onmessage = (event: MessageEvent<BackupWorkerRequest>) => {
       const backup = parseBackupText(event.data.text);
       response = { ok: true, value: backup, imageCount: embeddedImageCount(backup.notes) };
     } else {
-      const backup = createBackup(event.data.notes, event.data.settings);
-      response = { ok: true, value: JSON.stringify(backup, null, 2) };
+      const backup = createBackup(event.data.notes, event.data.settings, Date.now(), event.data.library);
+      const serialized = JSON.stringify(backup, null, 2);
+      parseBackupText(serialized);
+      response = { ok: true, value: serialized };
     }
     self.postMessage(response);
   } catch (error) {

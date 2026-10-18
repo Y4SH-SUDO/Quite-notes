@@ -1,17 +1,20 @@
 import type { NoteKind, QuietNote, QuietSettings } from '../quiet-storage';
+import type { LibraryDocumentBackup, ReaderFormat } from './reading-library';
+import { isValidHandwritingPages } from './handwriting.ts';
 
 export type QuietNotesBackup = {
   app: 'quiet-notes';
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   exportedAt: number;
   notes: QuietNote[];
   settings: QuietSettings;
   tags: string[];
+  library?: LibraryDocumentBackup[];
 };
 
 export type BackupWorkerRequest =
   | { action: 'parse'; text: string }
-  | { action: 'serialize'; notes: QuietNote[]; settings: QuietSettings };
+  | { action: 'serialize'; notes: QuietNote[]; settings: QuietSettings; library?: LibraryDocumentBackup[] };
 
 export type BackupWorkerResponse =
   | { ok: true; value: QuietNotesBackup | string; imageCount?: number }
@@ -40,14 +43,21 @@ export function createBackup(
   notes: QuietNote[],
   settings: QuietSettings,
   exportedAt = Date.now(),
+  library?: LibraryDocumentBackup[],
 ): QuietNotesBackup {
+  const extendedBackup = library !== undefined || notes.some(note => note.handwriting !== undefined);
   return {
     app: 'quiet-notes',
-    schemaVersion: 1,
+    schemaVersion: extendedBackup ? 2 : 1,
     exportedAt,
     notes: notes.map(note => ({ ...note })),
     settings,
     tags: tagsForNotes(notes),
+    ...(extendedBackup ? { library: (library ?? []).map(document => ({
+      ...document,
+      bookmarks: document.bookmarks.map(bookmark => ({ ...bookmark })),
+      highlights: document.highlights.map(highlight => ({ ...highlight })),
+    })) } : {}),
   };
 }
 
@@ -96,10 +106,35 @@ function validNote(value: unknown): value is QuietNote {
     && typeof value.recentlyOpenedAt === 'number' && Number.isFinite(value.recentlyOpenedAt) && value.recentlyOpenedAt >= 0
     && (value.pinned === undefined || typeof value.pinned === 'boolean')
     && (value.favorite === undefined || typeof value.favorite === 'boolean')
+    && (value.handwriting === undefined || isValidHandwritingPages(value.handwriting))
     && (value.kind === 'task' || !hasTaskSchedule)
     && (value.dueDate === undefined || (typeof value.dueDate === 'string' && validDateOnly(value.dueDate)))
     && (value.reminderAt === undefined || (typeof value.reminderAt === 'number' && Number.isFinite(value.reminderAt) && value.reminderAt >= 0))
     && (value.reminderTimezone === undefined || validTimeZone(value.reminderTimezone));
+}
+
+function validLibraryDocument(value: unknown): value is LibraryDocumentBackup {
+  if (!isRecord(value)) return false;
+  const formats: ReaderFormat[] = ['pdf', 'epub', 'txt', 'md'];
+  const validPositionItems = (items: unknown, kind: 'bookmark' | 'highlight') =>
+    Array.isArray(items) && items.every(item => {
+      if (!isRecord(item) || typeof item.id !== 'string' || typeof item.createdAt !== 'number') return false;
+      if (typeof item.position !== 'string') return false;
+      if (kind === 'bookmark') return typeof item.label === 'string';
+      return typeof item.text === 'string'
+        && typeof item.note === 'string'
+        && typeof item.updatedAt === 'number';
+    });
+  return typeof value.id === 'string' && value.id.length > 0
+    && typeof value.title === 'string'
+    && typeof value.format === 'string' && formats.includes(value.format as ReaderFormat)
+    && typeof value.mimeType === 'string'
+    && typeof value.size === 'number' && Number.isFinite(value.size) && value.size >= 0
+    && typeof value.createdAt === 'number' && Number.isFinite(value.createdAt) && value.createdAt >= 0
+    && typeof value.updatedAt === 'number' && Number.isFinite(value.updatedAt) && value.updatedAt >= 0
+    && typeof value.lastPosition === 'string'
+    && validPositionItems(value.bookmarks, 'bookmark')
+    && validPositionItems(value.highlights, 'highlight');
 }
 
 export function parseBackupText(text: string): QuietNotesBackup {
@@ -110,7 +145,7 @@ export function parseBackupText(text: string): QuietNotesBackup {
     throw new Error('This file is not valid JSON.');
   }
 
-  if (!isRecord(input) || input.app !== 'quiet-notes' || input.schemaVersion !== 1) {
+  if (!isRecord(input) || input.app !== 'quiet-notes' || ![1, 2].includes(input.schemaVersion as number)) {
     throw new Error('This is not a supported Quiet Notes backup.');
   }
   if (!Array.isArray(input.notes) || !input.notes.every(validNote)) {
@@ -125,6 +160,13 @@ export function parseBackupText(text: string): QuietNotesBackup {
   if (!Array.isArray(input.tags) || !input.tags.every(tag => typeof tag === 'string')) {
     throw new Error('The backup tag list is invalid.');
   }
+  if (
+    (input.schemaVersion === 1 && input.library !== undefined)
+    || (input.schemaVersion === 1 && input.notes.some(note => note.handwriting !== undefined))
+    || (input.schemaVersion === 2 && (!Array.isArray(input.library) || !input.library.every(validLibraryDocument)))
+  ) {
+    throw new Error('The backup contains invalid reading-library metadata.');
+  }
 
   const ids = new Set<string>();
   for (const note of input.notes) {
@@ -132,6 +174,16 @@ export function parseBackupText(text: string): QuietNotesBackup {
       throw new Error(`The backup contains the note ID "${note.id}" more than once.`);
     }
     ids.add(note.id);
+  }
+  const documentIds = new Set<string>();
+  if (Array.isArray(input.library)) {
+    for (const document of input.library) {
+      if (!isRecord(document) || typeof document.id !== 'string') continue;
+      if (documentIds.has(document.id)) {
+        throw new Error(`The backup contains reading-library ID "${document.id}" more than once.`);
+      }
+      documentIds.add(document.id);
+    }
   }
   if (JSON.stringify(input.tags) !== JSON.stringify(tagsForNotes(input.notes))) {
     throw new Error('The backup tag list does not match its notes.');

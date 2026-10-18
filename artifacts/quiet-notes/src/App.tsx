@@ -1,4 +1,4 @@
-import { type ChangeEvent, type PointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type ChangeEvent, type PointerEvent, type ReactNode, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { App as CapacitorApp } from '@capacitor/app';
 import { Capacitor } from '@capacitor/core';
 import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
@@ -6,13 +6,19 @@ import { Share } from '@capacitor/share';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
 import { Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
 import {
-  AlignCenter, AlignLeft, AlignRight, ArrowDown, ArrowLeft, ArrowUp, Bell, Bold, Check,
+  AlignCenter, AlignLeft, AlignRight, ArrowDown, ArrowLeft, ArrowUp, Bell, Bold, BookOpen, Check,
   Clock3, Download, FileText, ImagePlus, Italic, Library, ListChecks, ListTodo,
-  MoreHorizontal, Pin, Plus, Search, Settings, Star, Trash2, Underline,
+  MoreHorizontal, PenLine, Pin, Plus, Search, Settings, Star, Trash2, Underline,
   Upload, X,
 } from 'lucide-react';
 import {
@@ -21,9 +27,20 @@ import {
 } from './quiet-storage';
 import {
   runBackupWorker,
+  parseBackupText,
   type ImportStrategy, type QuietNotesBackup,
 } from './lib/backup';
+import { toLibraryDocumentBackup, type LibraryDocument } from './lib/reading-library';
+import { createLibraryDocument, importAndRefreshLibrary, readerFormatForFile } from './lib/reading-library';
+import type { HandwritingPage } from './lib/handwriting';
 import { noteFlagSaveCoordinator, NoteFlagSaveCoordinator, type NoteFlag } from './lib/note-actions';
+import {
+  AutomaticBackupRunner,
+  offlineBackupPlugin,
+  statusForSavedBackup,
+  type AutomaticBackupStatus,
+  type BackupFolder,
+} from './lib/offline-backup';
 import {
   currentReminderPermission, requestReminderPermission, scheduleTaskReminders,
   sendReminderTestNotification,
@@ -40,6 +57,9 @@ import {
 } from './lib/editor-dom';
 
 const queryClient = new QueryClient();
+const DocumentReader = lazy(() => import('@/components/reading-library').then(module => ({ default: module.DocumentReader })));
+const ReadingLibraryScreen = lazy(() => import('@/components/reading-library').then(module => ({ default: module.ReadingLibraryScreen })));
+const HandwritingCanvas = lazy(() => import('@/components/handwriting-canvas').then(module => ({ default: module.HandwritingCanvas })));
 const cloudSyncTimeoutMs = 60_000;
 const backupChunkSize = 256 * 1024;
 const routerBase = import.meta.env.BASE_URL.startsWith('/')
@@ -151,19 +171,24 @@ function isTextBlock(element: Element | null | undefined): element is HTMLElemen
 function AppSurface() {
   const [notes, setNotes] = useState<QuietNote[]>([]);
   const [settings, setSettings] = useState<QuietSettings>(defaultSettings);
-  const [screen, setScreen] = useState<'home' | 'library' | 'editor' | 'settings'>('home');
+  const [screen, setScreen] = useState<'home' | 'library' | 'editor' | 'settings' | 'reading-library' | 'reader'>('home');
   const [activeNote, setActiveNote] = useState<QuietNote | null>(null);
   const [search, setSearch] = useState('');
   const [librarySearch, setLibrarySearch] = useState('');
   const [libraryKind, setLibraryKind] = useState<'all' | NoteKind>('all');
   const [libraryFavoritesOnly, setLibraryFavoritesOnly] = useState(false);
   const [libraryTag, setLibraryTag] = useState<string | null>(null);
+  const [readingDocuments, setReadingDocuments] = useState<LibraryDocument[]>([]);
+  const [activeReadingDocument, setActiveReadingDocument] = useState<LibraryDocument | null>(null);
+  const [readingLibraryStatus, setReadingLibraryStatus] = useState('');
   const [taskFilter, setTaskFilter] = useState<'all' | 'open' | 'complete'>('all');
   const [kindMenu, setKindMenu] = useState(false);
   const [editorSettingsOpen, setEditorSettingsOpen] = useState(false);
   const [storeError, setStoreError] = useState('');
   const [pendingFlagSaves, setPendingFlagSaves] = useState<ReturnType<NoteFlagSaveCoordinator['getPending']>>([]);
   const flagSaveCoordinatorRef = useRef(noteFlagSaveCoordinator);
+  const [openNoteMenuId, setOpenNoteMenuId] = useState<string | null>(null);
+  const openNoteMenuRef = useRef<string | null>(null);
   const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [saveState, setSaveState] = useState<'saved' | 'saving' | 'error'>('saved');
   const [saveMessage, setSaveMessage] = useState('');
@@ -171,6 +196,11 @@ function AppSurface() {
   const [backupPreview, setBackupPreview] = useState<BackupPreview | null>(null);
   const [backupStrategy, setBackupStrategy] = useState<ImportStrategy>('merge');
   const [backupStatus, setBackupStatus] = useState<BackupStatus | null>(null);
+  const [automaticBackupStatus, setAutomaticBackupStatus] = useState<AutomaticBackupStatus | null>(null);
+  const [automaticBackupFolder, setAutomaticBackupFolder] = useState<BackupFolder | null>(null);
+  const automaticBackupFolderRef = useRef<BackupFolder | null>(null);
+  const automaticBackupRunnerRef = useRef<AutomaticBackupRunner | null>(null);
+  const pendingEditorSaveRef = useRef<Promise<void> | null>(null);
   const [reminderPermission, setReminderPermission] = useState<ReminderPermission>('unsupported');
   const [reminderStatus, setReminderStatus] = useState('');
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
@@ -184,12 +214,17 @@ function AppSurface() {
   const syncStageRef = useRef('initializing Firebase');
   const screenRef = useRef(screen);
   const editorSettingsOpenRef = useRef(editorSettingsOpen);
-  const editorBackHandlerRef = useRef<(() => void) | null>(null);
+  const editorBackHandlerRef = useRef<(() => void | Promise<void>) | null>(null);
   const returnScreenRef = useRef<'home' | 'library'>('home');
   screenRef.current = screen;
   editorSettingsOpenRef.current = editorSettingsOpen;
 
-  const registerEditorBackHandler = useCallback((handler: (() => void) | null) => {
+  const updateOpenNoteMenu = useCallback((noteId: string | null) => {
+    openNoteMenuRef.current = noteId;
+    setOpenNoteMenuId(noteId);
+  }, []);
+
+  const registerEditorBackHandler = useCallback((handler: (() => void | Promise<void>) | null) => {
     editorBackHandlerRef.current = handler;
   }, []);
 
@@ -199,12 +234,16 @@ function AppSurface() {
     let listener: { remove: () => Promise<void> } | undefined;
     void CapacitorApp.addListener('backButton', () => {
       const currentScreen = screenRef.current;
-      if (currentScreen === 'editor' && editorSettingsOpenRef.current) {
+      if (openNoteMenuRef.current) {
+        updateOpenNoteMenu(null);
+      } else if (currentScreen === 'editor' && editorSettingsOpenRef.current) {
         setEditorSettingsOpen(false);
       } else if (currentScreen === 'editor') {
         if (editorBackHandlerRef.current) editorBackHandlerRef.current();
         else setScreen(returnScreenRef.current);
-      } else if (currentScreen === 'library' || currentScreen === 'settings') {
+      } else if (currentScreen === 'reader') {
+        setScreen('reading-library');
+      } else if (currentScreen === 'library' || currentScreen === 'reading-library' || currentScreen === 'settings') {
         setScreen('home');
       } else {
         void CapacitorApp.exitApp();
@@ -219,7 +258,11 @@ function AppSurface() {
       mounted = false;
       if (listener) void listener.remove();
     };
-  }, []);
+  }, [updateOpenNoteMenu]);
+
+  useEffect(() => {
+    updateOpenNoteMenu(null);
+  }, [screen, updateOpenNoteMenu]);
 
   const refreshNotes = useCallback(async () => {
     try {
@@ -397,6 +440,197 @@ function AppSurface() {
   }, [firebaseUser, refreshNotes, synchronizeNotes]);
 
   useEffect(() => { void refreshNotes(); }, [refreshNotes]);
+  useEffect(() => {
+    void quietStorage.listReadingDocuments().then(setReadingDocuments).catch(error => {
+      setReadingLibraryStatus(error instanceof Error ? error.message : 'The reading library could not be opened.');
+    });
+  }, []);
+
+  const importReadingDocument = useCallback(async (file?: File) => {
+    try {
+      let name: string;
+      let mimeType: string;
+      let data: Blob;
+      if (Capacitor.getPlatform() === 'android') {
+        const selected = await offlineBackupPlugin.selectDocument();
+        if (selected.canceled) return;
+        if (!selected.name || !selected.base64) throw new Error('Android did not return the selected document data.');
+        const format = readerFormatForFile(selected.name, selected.mimeType ?? '');
+        if (!format) throw new Error('Unsupported file. Choose a PDF, EPUB, TXT, or Markdown document.');
+        const bytes = Uint8Array.from(atob(selected.base64), character => character.charCodeAt(0));
+        name = selected.name;
+        mimeType = selected.mimeType ?? 'application/octet-stream';
+        data = new Blob([bytes], { type: mimeType });
+      } else {
+        if (!file) return;
+        const format = readerFormatForFile(file.name, file.type);
+        if (!format) throw new Error('Unsupported file. Choose a PDF, EPUB, TXT, or Markdown document.');
+        name = file.name;
+        mimeType = file.type || 'application/octet-stream';
+        data = file;
+      }
+      const format = readerFormatForFile(name, mimeType);
+      if (!format) throw new Error('Unsupported file. Choose a PDF, EPUB, TXT, or Markdown document.');
+      if (data.size === 0) throw new Error('The selected document is empty.');
+      if (data.size > 50 * 1024 * 1024) throw new Error('Documents larger than 50 MB cannot be imported yet.');
+      if (format === 'pdf') {
+        const signature = new TextDecoder().decode((await data.slice(0, 5).arrayBuffer()));
+        if (signature !== '%PDF-') throw new Error('The selected file does not contain a valid PDF header.');
+      }
+      if (format === 'epub') {
+        const signature = new Uint8Array(await data.slice(0, 2).arrayBuffer());
+        if (signature[0] !== 0x50 || signature[1] !== 0x4b) throw new Error('The selected file does not contain a valid EPUB archive.');
+      }
+      const existing = await quietStorage.listReadingDocuments();
+      const title = name.replace(/\.[^.]+$/, '');
+      const duplicates = existing.filter(item => item.title === title && item.size === data.size && item.fileData);
+      let duplicateFound = false;
+      const incomingBytes = duplicates.length ? new Uint8Array(await data.arrayBuffer()) : null;
+      for (const item of duplicates) {
+        if (!item.fileData || !incomingBytes) continue;
+        const existingBytes = new Uint8Array(await item.fileData.arrayBuffer());
+        if (incomingBytes.every((byte, index) => byte === existingBytes[index])) {
+          duplicateFound = true;
+          break;
+        }
+      }
+      if (duplicateFound) {
+        throw new Error('A document with the same name and size is already in the reading library.');
+      }
+      const document = createLibraryDocument({
+        id: crypto.randomUUID(),
+        title,
+        format,
+        mimeType,
+        size: data.size,
+        fileData: data,
+      });
+      await quietStorage.saveReadingDocument(document);
+      setReadingDocuments(current => [document, ...current]);
+      setReadingLibraryStatus('');
+    } catch (error) {
+      setReadingLibraryStatus(error instanceof Error ? error.message : 'The selected document could not be imported.');
+    }
+  }, []);
+
+  const updateReadingDocument = useCallback((document: LibraryDocument) => {
+    setReadingDocuments(current => current.map(item => item.id === document.id ? document : item));
+    setActiveReadingDocument(document);
+    void quietStorage.saveReadingDocument(document).then(() => setReadingLibraryStatus('')).catch(error => {
+      setReadingLibraryStatus(error instanceof Error ? error.message : 'Reading progress could not be saved.');
+    });
+  }, []);
+
+  const deleteReadingDocument = useCallback(async (document: LibraryDocument) => {
+    if (!window.confirm(`Remove “${document.title}” and its reading notes from this device? This cannot be undone.`)) return;
+    try {
+      await quietStorage.deleteReadingDocument(document.id);
+      setReadingDocuments(current => current.filter(item => item.id !== document.id));
+      setActiveReadingDocument(null);
+      setScreen('reading-library');
+      setReadingLibraryStatus('Document removed from this device.');
+    } catch (error) {
+      setReadingLibraryStatus(error instanceof Error ? error.message : 'The document could not be removed.');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (Capacitor.getPlatform() !== 'android') return;
+    let mounted = true;
+    const persistStatus = (status: AutomaticBackupStatus) => {
+      setAutomaticBackupStatus(status);
+      void quietStorage.saveBackupStatus(JSON.stringify(status)).catch(error => {
+        setAutomaticBackupStatus({
+          kind: 'error',
+          message: `Automatic backup status could not be saved: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      });
+    };
+    const runner = new AutomaticBackupRunner(async () => {
+      const [storedNotes, storedSettings, storedDocuments] = await Promise.all([
+        quietStorage.listNotes(),
+        quietStorage.getSettings(),
+        quietStorage.listReadingDocuments(),
+      ]);
+      const response = await runBackupWorker({
+        action: 'serialize',
+        notes: storedNotes,
+        settings: storedSettings ?? defaultSettings,
+        library: storedDocuments.map(toLibraryDocumentBackup),
+      });
+      if (!response.ok) throw new Error(response.error);
+      if (typeof response.value !== 'string') throw new Error('The automatic backup snapshot was not serialized.');
+      parseBackupText(response.value);
+      return response.value;
+    }, async content => {
+      if (!automaticBackupFolderRef.current) throw new Error('Choose a destination folder for automatic backups.');
+      await offlineBackupPlugin.writeBackup({ content });
+    }, persistStatus);
+    automaticBackupRunnerRef.current = runner;
+    const onLocalDataChanged = () => {
+      if (automaticBackupFolderRef.current) runner.request();
+    };
+    window.addEventListener('quiet-notes-data-changed', onLocalDataChanged);
+    void Promise.all([
+      offlineBackupPlugin.getFolder(),
+      quietStorage.getBackupStatus(),
+    ]).then(([folderResult, statusValue]) => {
+      if (!mounted) return;
+      const folder = folderResult.uri && folderResult.name
+        ? { uri: folderResult.uri, name: folderResult.name }
+        : null;
+      automaticBackupFolderRef.current = folder;
+      setAutomaticBackupFolder(folder);
+      const previousStatus = statusForSavedBackup(statusValue ?? null);
+      if (folder) runner.request();
+      else setAutomaticBackupStatus(previousStatus);
+    }).catch(error => {
+      if (mounted) {
+        setAutomaticBackupStatus({
+          kind: 'error',
+          message: error instanceof Error ? error.message : 'The configured automatic backup could not be checked.',
+        });
+      }
+    });
+    return () => {
+      mounted = false;
+      window.removeEventListener('quiet-notes-data-changed', onLocalDataChanged);
+      automaticBackupRunnerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (Capacitor.getPlatform() !== 'android') return;
+    let mounted = true;
+    let listener: { remove: () => Promise<void> } | undefined;
+    void CapacitorApp.addListener('appStateChange', state => {
+      if (state.isActive) return;
+      void (async () => {
+        await Promise.resolve();
+        await pendingEditorSaveRef.current;
+        await automaticBackupRunnerRef.current?.flush();
+      })().catch(error => {
+        if (mounted) {
+          setAutomaticBackupStatus({
+            kind: 'error',
+            message: error instanceof Error ? error.message : 'The pending backup could not be completed before the app was paused.',
+          });
+        }
+      });
+    }).then(handle => {
+      if (mounted) listener = handle;
+      else void handle.remove();
+    }).catch(error => {
+      setAutomaticBackupStatus({
+        kind: 'error',
+        message: error instanceof Error ? error.message : 'Automatic backup pause handling could not be initialized.',
+      });
+    });
+    return () => {
+      mounted = false;
+      if (listener) void listener.remove();
+    };
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -495,8 +729,10 @@ function AppSurface() {
   const persistNote = useCallback(async (updated: QuietNote) => {
     updateNoteMemory(updated);
     setSaveState('saving');
+    const save = quietStorage.saveNote(updated);
+    pendingEditorSaveRef.current = save.then(() => undefined, () => undefined);
     try {
-      await quietStorage.saveNote(updated);
+      await save;
       setSaveState('saved');
       setStoreError('');
     } catch (error) {
@@ -504,6 +740,8 @@ function AppSurface() {
       setStoreError(error instanceof Error ? error.message : 'Your edits could not be saved.');
     }
   }, [updateNoteMemory]);
+
+  const flushAutomaticBackup = useCallback(() => automaticBackupRunnerRef.current?.flush(), []);
 
   const publishPendingFlagSaves = useCallback(() => {
     setPendingFlagSaves(flagSaveCoordinatorRef.current?.getPending() ?? []);
@@ -539,6 +777,27 @@ function AppSurface() {
     publishPendingFlagSaves();
   }, [publishPendingFlagSaves]);
 
+  const selectAutomaticBackupFolder = useCallback(async () => {
+    try {
+      const selected = await offlineBackupPlugin.selectFolder();
+      if (selected.canceled) return;
+      if (!selected.uri || !selected.name) throw new Error('Android did not return a usable backup folder.');
+      const folder = { uri: selected.uri, name: selected.name };
+      automaticBackupFolderRef.current = folder;
+      setAutomaticBackupFolder(folder);
+      automaticBackupRunnerRef.current?.request();
+    } catch (error) {
+      const status: AutomaticBackupStatus = {
+        kind: 'error',
+        message: error instanceof Error ? error.message : 'A backup folder could not be selected.',
+      };
+      setAutomaticBackupStatus(status);
+      void quietStorage.saveBackupStatus(JSON.stringify(status)).catch(() => {
+        setAutomaticBackupStatus({ kind: 'error', message: `${status.message} The error status could not be saved.` });
+      });
+    }
+  }, []);
+
   const deleteNote = useCallback(async (note: QuietNote) => {
     if (!window.confirm('Delete this page from this device? This cannot be undone.')) return;
     try {
@@ -569,14 +828,16 @@ function AppSurface() {
     setBackupBusy(true);
     setBackupStatus(null);
     try {
-      const [storedNotes, storedSettings] = await Promise.all([
+      const [storedNotes, storedSettings, storedDocuments] = await Promise.all([
         quietStorage.listNotes(),
         quietStorage.getSettings(),
+        quietStorage.listReadingDocuments(),
       ]);
       const response = await runBackupWorker({
         action: 'serialize',
         notes: storedNotes,
         settings: storedSettings ?? defaultSettings,
+        library: storedDocuments.map(toLibraryDocumentBackup),
       });
       if (!response.ok) throw new Error(response.error);
       if (typeof response.value !== 'string') throw new Error('The backup could not be prepared for download.');
@@ -682,10 +943,15 @@ function AppSurface() {
     setBackupBusy(true);
     setBackupStatus(null);
     try {
-      const result: BackupImportResult = await quietStorage.importBackup(
-        backupPreview.backup.notes,
-        backupPreview.backup.settings,
-        backupStrategy,
+      const result: BackupImportResult = await importAndRefreshLibrary(
+        () => quietStorage.importBackup(
+          backupPreview.backup.notes,
+          backupPreview.backup.settings,
+          backupStrategy,
+          backupPreview.backup.library ?? [],
+        ),
+        () => quietStorage.listReadingDocuments(),
+        setReadingDocuments,
       );
       setBackupPreview(null);
       await refreshNotes();
@@ -695,9 +961,12 @@ function AppSurface() {
           text: `Nothing was imported because ${result.duplicateIds.length} duplicate ${result.duplicateIds.length === 1 ? 'ID was' : 'IDs were'} found. Existing notes and preferences were left unchanged.`,
         });
       } else {
+        const restoredDocuments = result.readingDocumentsImportedCount
+          ? ` Restored ${result.readingDocumentsImportedCount} reading-library ${result.readingDocumentsImportedCount === 1 ? 'entry' : 'entries'}; the original document files must be imported again.`
+          : '';
         setBackupStatus({
           kind: 'success',
-          text: `Imported ${result.importedCount} ${result.importedCount === 1 ? 'note' : 'notes'}${result.skippedCount ? `; kept ${result.skippedCount} existing ${result.skippedCount === 1 ? 'note' : 'notes'} unchanged` : ''}. Writing preferences restored.`,
+          text: `Imported ${result.importedCount} ${result.importedCount === 1 ? 'note' : 'notes'}${result.skippedCount ? `; kept ${result.skippedCount} existing ${result.skippedCount === 1 ? 'note' : 'notes'} unchanged` : ''}. Writing preferences restored.${restoredDocuments}`,
         });
       }
     } catch (error) {
@@ -753,10 +1022,13 @@ function AppSurface() {
           onRetry={() => void refreshNotes()}
           onCreate={() => setKindMenu(value => !value)}
           onLibrary={() => { setKindMenu(false); setScreen('library'); }}
-          onOpen={note => { returnScreenRef.current = 'home'; void openNote(note); }}
+          onReadingLibrary={() => { setKindMenu(false); setScreen('reading-library'); }}
+          onOpen={note => { updateOpenNoteMenu(null); returnScreenRef.current = 'home'; void openNote(note); }}
           onDelete={note => void deleteNote(note)}
           onPin={note => void toggleNoteFlag(note, 'pinned')}
           onFavorite={note => void toggleNoteFlag(note, 'favorite')}
+          openNoteMenuId={openNoteMenuId}
+          onOpenNoteMenuChange={updateOpenNoteMenu}
           kindMenu={kindMenu}
           onPickKind={kind => void createNote(kind)}
           onSettings={() => { setKindMenu(false); setScreen('settings'); }}
@@ -780,11 +1052,41 @@ function AppSurface() {
           onTaskFilterChange={setTaskFilter}
           onRetry={() => void refreshNotes()}
           onBack={() => setScreen('home')}
-          onOpen={note => { returnScreenRef.current = 'library'; void openNote(note); }}
+          onOpen={note => { updateOpenNoteMenu(null); returnScreenRef.current = 'library'; void openNote(note); }}
           onDelete={note => void deleteNote(note)}
           onPin={note => void toggleNoteFlag(note, 'pinned')}
           onFavorite={note => void toggleNoteFlag(note, 'favorite')}
+          openNoteMenuId={openNoteMenuId}
+          onOpenNoteMenuChange={updateOpenNoteMenu}
         />
+      )}
+
+      {screen === 'reading-library' && (
+        <Suspense fallback={<p className="px-8 pt-12 text-sm text-[#777168]">Opening the reading room…</p>}>
+          <ReadingLibraryScreen
+            documents={readingDocuments}
+            status={readingLibraryStatus}
+            nativePicker={Capacitor.getPlatform() === 'android'}
+            onImport={file => void importReadingDocument(file)}
+            onBack={() => setScreen('home')}
+            onOpen={document => {
+              setActiveReadingDocument(document);
+              setScreen('reader');
+            }}
+            onDelete={document => void deleteReadingDocument(document)}
+          />
+        </Suspense>
+      )}
+
+      {screen === 'reader' && activeReadingDocument && (
+        <Suspense fallback={<p className="px-8 pt-12 text-sm text-[#777168]">Opening document…</p>}>
+          <DocumentReader
+            document={activeReadingDocument}
+            onBack={() => setScreen('reading-library')}
+            onDelete={() => void deleteReadingDocument(activeReadingDocument)}
+            onChange={updateReadingDocument}
+          />
+        </Suspense>
       )}
 
       {screen === 'editor' && activeNote && (
@@ -794,7 +1096,8 @@ function AppSurface() {
           settings={settings}
           saveState={saveState}
           saveMessage={saveMessage}
-          onSave={updated => void persistNote(updated)}
+          onSave={persistNote}
+          onFlushBackup={flushAutomaticBackup}
           onBack={() => { setEditorSettingsOpen(false); setScreen(returnScreenRef.current); setKindMenu(false); }}
           onDelete={() => void deleteNote(activeNote)}
           onSaveMessage={setSaveMessage}
@@ -848,6 +1151,10 @@ function AppSurface() {
             preview: backupPreview,
             strategy: backupStrategy,
             status: backupStatus,
+            automaticBackupFolder,
+            automaticBackupStatus,
+            automaticBackupAvailable: Capacitor.getPlatform() === 'android',
+            onSelectAutomaticBackupFolder: () => void selectAutomaticBackupFolder(),
             onExport: () => void exportBackup(),
             onSelectFile: file => void previewBackupFile(file),
             onStrategyChange: setBackupStrategy,
@@ -869,11 +1176,19 @@ function NoteListItem(props: {
   onDelete: (note: QuietNote) => void;
   onPin: (note: QuietNote) => void;
   onFavorite: (note: QuietNote) => void;
+  openNoteMenuId: string | null;
+  onOpenNoteMenuChange: (noteId: string | null) => void;
 }) {
-  const [menuOpen, setMenuOpen] = useState(false);
+  const menuOpen = props.openNoteMenuId === props.note.id;
   const pressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pressStartRef = useRef<{ x: number; y: number } | null>(null);
   const suppressClickRef = useRef(false);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOnScroll = () => props.onOpenNoteMenuChange(null);
+    window.addEventListener('scroll', closeOnScroll, true);
+    return () => window.removeEventListener('scroll', closeOnScroll, true);
+  }, [menuOpen, props.onOpenNoteMenuChange]);
   const clearPress = () => {
     if (pressTimerRef.current) clearTimeout(pressTimerRef.current);
     pressTimerRef.current = null;
@@ -883,7 +1198,7 @@ function NoteListItem(props: {
     pressStartRef.current = { x: event.clientX, y: event.clientY };
     pressTimerRef.current = setTimeout(() => {
       suppressClickRef.current = true;
-      setMenuOpen(true);
+      props.onOpenNoteMenuChange(props.note.id);
     }, 550);
   };
   const movePress = (event: PointerEvent<HTMLButtonElement>) => {
@@ -901,7 +1216,7 @@ function NoteListItem(props: {
       data-testid={props.testId}
       onContextMenu={event => {
         event.preventDefault();
-        setMenuOpen(true);
+        props.onOpenNoteMenuChange(props.note.id);
       }}
     >
       <button
@@ -930,38 +1245,51 @@ function NoteListItem(props: {
         <p className="mb-0 mt-1 truncate font-serif text-sm leading-relaxed text-[#74706a]" data-testid={`text-preview-${props.note.id}`}>{notePreview(props.note)}</p>
         {props.detail && <div className="mt-2">{props.detail}</div>}
       </button>
-      <div className="relative mt-1 shrink-0">
-        <button
+      <DropdownMenu
+        open={menuOpen}
+        onOpenChange={open => {
+          if (open) props.onOpenNoteMenuChange(props.note.id);
+          else if (props.openNoteMenuId === props.note.id) props.onOpenNoteMenuChange(null);
+        }}
+      >
+        <DropdownMenuTrigger asChild>
+          <button
           type="button"
-          onClick={() => setMenuOpen(value => !value)}
-          className="control-focus grid h-9 w-9 place-items-center rounded-full text-[#777168] transition hover:bg-[#211f1a] hover:text-[#d5cbb8]"
+          className="control-focus grid h-9 w-9 shrink-0 place-items-center rounded-full text-[#777168] transition hover:bg-[#211f1a] hover:text-[#d5cbb8]"
           aria-label={`Actions for ${noteName}`}
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
           data-testid={`button-note-actions-${props.note.id}`}
-        >
-          <MoreHorizontal size={17} />
-        </button>
-        {menuOpen && (
-          <div
-            role="menu"
-            onKeyDown={event => {
-              if (event.key === 'Escape') setMenuOpen(false);
-            }}
-            className="absolute right-0 top-10 z-20 min-w-44 rounded-xl border border-[#2d2b27] bg-[#11110f] p-1.5 shadow-xl soft-in"
           >
-            <button role="menuitem" onClick={() => { props.onPin(props.note); setMenuOpen(false); }} className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3 text-left text-sm text-[#d8d2c7] hover:bg-[#211f1a]" data-testid={`button-pin-note-${props.note.id}`}>
-              <Pin size={15} />{props.note.pinned ? 'Unpin note' : 'Pin note'}
-            </button>
-            <button role="menuitem" onClick={() => { props.onFavorite(props.note); setMenuOpen(false); }} className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3 text-left text-sm text-[#d8d2c7] hover:bg-[#211f1a]" data-testid={`button-favorite-note-${props.note.id}`}>
-              <Star size={15} />{props.note.favorite ? 'Remove favorite' : 'Add favorite'}
-            </button>
-            <button role="menuitem" onClick={() => { setMenuOpen(false); props.onDelete(props.note); }} className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3 text-left text-sm text-[#c39a8a] hover:bg-[#211917]" data-testid={`button-delete-note-${props.note.id}`}>
-              <Trash2 size={15} />Delete note
-            </button>
-          </div>
-        )}
-      </div>
+            <MoreHorizontal size={17} />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          align="end"
+          className="min-w-44 rounded-xl border-[#2d2b27] bg-[#11110f] p-1.5 text-[#d8d2c7] shadow-xl"
+          data-testid={`menu-note-actions-${props.note.id}`}
+        >
+          <DropdownMenuItem
+            onSelect={() => props.onPin(props.note)}
+            className="min-h-10 rounded-lg px-3 text-sm text-[#d8d2c7] focus:bg-[#211f1a] focus:text-[#d8d2c7]"
+            data-testid={`button-pin-note-${props.note.id}`}
+          >
+            <Pin size={15} />{props.note.pinned ? 'Unpin note' : 'Pin note'}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={() => props.onFavorite(props.note)}
+            className="min-h-10 rounded-lg px-3 text-sm text-[#d8d2c7] focus:bg-[#211f1a] focus:text-[#d8d2c7]"
+            data-testid={`button-favorite-note-${props.note.id}`}
+          >
+            <Star size={15} />{props.note.favorite ? 'Remove favorite' : 'Add favorite'}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={() => props.onDelete(props.note)}
+            className="min-h-10 rounded-lg px-3 text-sm text-[#c39a8a] focus:bg-[#211917] focus:text-[#c39a8a]"
+            data-testid={`button-delete-note-${props.note.id}`}
+          >
+            <Trash2 size={15} />Delete note
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
     </article>
   );
 }
@@ -976,10 +1304,13 @@ function HomeScreen(props: {
   onRetry: () => void;
   onCreate: () => void;
   onLibrary: () => void;
+  onReadingLibrary: () => void;
   onOpen: (note: QuietNote) => void;
   onDelete: (note: QuietNote) => void;
   onPin: (note: QuietNote) => void;
   onFavorite: (note: QuietNote) => void;
+  openNoteMenuId: string | null;
+  onOpenNoteMenuChange: (noteId: string | null) => void;
   kindMenu: boolean;
   onPickKind: (kind: NoteKind) => void;
   onSettings: () => void;
@@ -1002,6 +1333,9 @@ function HomeScreen(props: {
           <div className="relative flex shrink-0 items-center gap-2">
             <button onClick={props.onLibrary} aria-label="Library" className="control-focus grid h-11 w-11 place-items-center rounded-full border border-[#302e29] text-[#aaa398] transition hover:bg-[#151412] hover:text-[#ded5c4]" data-testid="button-open-library">
               <Library size={18} strokeWidth={1.55} />
+            </button>
+            <button onClick={props.onReadingLibrary} aria-label="Reading room" className="control-focus grid h-11 w-11 place-items-center rounded-full border border-[#302e29] text-[#aaa398] transition hover:bg-[#151412] hover:text-[#ded5c4]" data-testid="button-open-reading-library">
+              <BookOpen size={18} strokeWidth={1.55} />
             </button>
             <button onClick={props.onCreate} aria-label="Create a page" className="control-focus grid h-[50px] w-[50px] place-items-center rounded-full border border-[#4a443a] bg-[#c9b999] text-[#171511] transition hover:bg-[#ddcdb0]" data-testid="button-open-create-menu">
               {props.kindMenu ? <X size={19} /> : <Plus size={22} strokeWidth={1.7} />}
@@ -1058,6 +1392,8 @@ function HomeScreen(props: {
             onDelete={props.onDelete}
             onPin={props.onPin}
             onFavorite={props.onFavorite}
+            openNoteMenuId={props.openNoteMenuId}
+            onOpenNoteMenuChange={props.onOpenNoteMenuChange}
           />
         ))}
         {!props.loading && !props.loadError && props.notes.length === 0 && (
@@ -1092,6 +1428,8 @@ function LibraryScreen(props: {
   onDelete: (note: QuietNote) => void;
   onPin: (note: QuietNote) => void;
   onFavorite: (note: QuietNote) => void;
+  openNoteMenuId: string | null;
+  onOpenNoteMenuChange: (noteId: string | null) => void;
 }) {
   const query = props.search.trim().toLowerCase();
   const matchedNotes = props.notes.filter(note => {
@@ -1131,6 +1469,8 @@ function LibraryScreen(props: {
       onDelete={props.onDelete}
       onPin={props.onPin}
       onFavorite={props.onFavorite}
+      openNoteMenuId={props.openNoteMenuId}
+      onOpenNoteMenuChange={props.onOpenNoteMenuChange}
     />
   );
 
@@ -1268,12 +1608,13 @@ function NoteEditor(props: {
   settings: QuietSettings;
   saveState: 'saved' | 'saving' | 'error';
   saveMessage: string;
-  onSave: (note: QuietNote) => void;
+  onSave: (note: QuietNote) => Promise<void>;
+  onFlushBackup: () => Promise<void> | undefined;
   onBack: () => void;
   onDelete: () => void;
   onSaveMessage: (message: string) => void;
   onSettings: () => void;
-  onRegisterBackHandler: (handler: (() => void) | null) => void;
+  onRegisterBackHandler: (handler: (() => void | Promise<void>) | null) => void;
 }) {
   const titleRef = useRef<HTMLInputElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -1285,11 +1626,16 @@ function NoteEditor(props: {
   const latestNoteRef = useRef(props.note);
   const [title, setTitle] = useState(props.note.title);
   const [body, setBody] = useState(props.note.content);
+  const titleValueRef = useRef(title);
+  const bodyValueRef = useRef(body);
+  titleValueRef.current = title;
+  bodyValueRef.current = body;
   const [hasSelection, setHasSelection] = useState(false);
   const [imageSelected, setImageSelected] = useState(false);
   const [editorFocused, setEditorFocused] = useState(false);
   const [imageOptions, setImageOptions] = useState<ImageOptions>(defaultImageOptions);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [handwritingOpen, setHandwritingOpen] = useState(false);
   const writingFontFamily = props.settings.fontFamily === 'Georgia'
     ? 'Georgia, serif'
     : "'Literata', Georgia, serif";
@@ -1319,7 +1665,7 @@ function NoteEditor(props: {
       const updated = { ...props.note, content: editor.innerHTML };
       latestNoteRef.current = updated;
       setBody(updated.content);
-      props.onSave(updated);
+      void props.onSave(updated);
     }
   }, [props.note.id]);
 
@@ -1362,24 +1708,64 @@ function NoteEditor(props: {
       updatedAt: Math.max(Date.now(), current.updatedAt + 1),
     };
     latestNoteRef.current = updated;
-    props.onSave(updated);
+    return props.onSave(updated);
   }, [props.onSave]);
+
+  const saveAndFlushBackup = useCallback(async (nextTitle: string, nextBody: string) => {
+    await flushSave(nextTitle, nextBody);
+    await props.onFlushBackup();
+  }, [flushSave, props.onFlushBackup]);
+
+  const saveHandwriting = (pages: HandwritingPage[]) => {
+    const current = latestNoteRef.current;
+    const updated = {
+      ...current,
+      title,
+      content: bodyRef.current ? serializeEditor(bodyRef.current) : body,
+      handwriting: pages,
+      updatedAt: Math.max(Date.now(), current.updatedAt + 1),
+    };
+    latestNoteRef.current = updated;
+    void props.onSave(updated);
+  };
 
   const updateTaskSchedule = (
     partial: Partial<Pick<QuietNote, 'dueDate' | 'reminderAt' | 'reminderTimezone'>>,
   ) => {
     const updated = mergeTaskSchedule(latestNoteRef.current, partial);
     latestNoteRef.current = updated;
-    props.onSave(updated);
+    void props.onSave(updated);
   };
 
   const scheduleSave = useCallback((nextTitle: string, nextBody: string) => {
     if (timerRef.current) clearTimeout(timerRef.current);
     props.onSaveMessage('');
-    timerRef.current = setTimeout(() => flushSave(nextTitle, nextBody), 550);
+    timerRef.current = setTimeout(() => { void flushSave(nextTitle, nextBody); }, 550);
   }, [flushSave, props.onSaveMessage]);
 
   useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+
+  useEffect(() => {
+    if (Capacitor.getPlatform() !== 'android') return;
+    let mounted = true;
+    let listener: { remove: () => Promise<void> } | undefined;
+    void CapacitorApp.addListener('appStateChange', state => {
+      if (state.isActive) return;
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = null;
+      void saveAndFlushBackup(titleValueRef.current, bodyRef.current ? serializeEditor(bodyRef.current) : bodyValueRef.current)
+        .catch(error => props.onSaveMessage(error instanceof Error ? error.message : 'The final note save failed.'));
+    }).then(handle => {
+      if (mounted) listener = handle;
+      else void handle.remove();
+    }).catch(error => {
+      props.onSaveMessage(error instanceof Error ? error.message : 'The editor could not prepare a final save.');
+    });
+    return () => {
+      mounted = false;
+      if (listener) void listener.remove();
+    };
+  }, [props.onSaveMessage, saveAndFlushBackup]);
 
   const handleTitle = (value: string) => {
     setTitle(value);
@@ -1492,12 +1878,12 @@ function NoteEditor(props: {
   };
 
   const saveStatus = props.saveState === 'saving' ? 'Saving…' : props.saveState === 'error' ? 'Not saved' : 'Saved on this device';
-  const leaveEditor = useCallback(() => {
+  const leaveEditor = useCallback(async () => {
     if (timerRef.current) clearTimeout(timerRef.current);
     if (props.saveState === 'error' && !window.confirm('This page has edits that did not save. Leave anyway?')) return;
-    flushSave(title, bodyRef.current?.innerHTML ?? body);
+    await saveAndFlushBackup(title, bodyRef.current ? serializeEditor(bodyRef.current) : body);
     props.onBack();
-  }, [body, flushSave, props.onBack, props.saveState, title]);
+  }, [body, props.onBack, props.saveState, saveAndFlushBackup, title]);
   const leaveEditorRef = useRef(leaveEditor);
   leaveEditorRef.current = leaveEditor;
 
@@ -1557,6 +1943,15 @@ function NoteEditor(props: {
         <div ref={toolbarRef} className="relative mb-5 flex min-h-9 flex-wrap items-center gap-1">
           <button onMouseDown={event => event.preventDefault()} onClick={chooseImage} className="control-focus inline-flex items-center gap-2 rounded-md px-2.5 py-2 text-xs text-[#77736c] transition hover:bg-[#151412] hover:text-[#d5cbb8]" data-testid="button-insert-image">
             <ImagePlus size={15} strokeWidth={1.6} /><span>Add image</span>
+          </button>
+          <button
+            onMouseDown={event => event.preventDefault()}
+            onClick={() => setHandwritingOpen(value => !value)}
+            aria-pressed={handwritingOpen}
+            className={`control-focus inline-flex items-center gap-2 rounded-md px-2.5 py-2 text-xs transition ${handwritingOpen ? 'bg-[#211f1a] text-[#d5cbb8]' : 'text-[#77736c] hover:bg-[#151412] hover:text-[#d5cbb8]'}`}
+            data-testid="button-toggle-handwriting"
+          >
+            <PenLine size={15} strokeWidth={1.6} /><span>Handwriting</span>
           </button>
           {(editorFocused || hasSelection || imageSelected) && (
             <>
@@ -1683,14 +2078,22 @@ function NoteEditor(props: {
             if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
               event.preventDefault();
               if (timerRef.current) clearTimeout(timerRef.current);
-              flushSave(title, bodyRef.current ? serializeEditor(bodyRef.current) : body);
+              void saveAndFlushBackup(title, bodyRef.current ? serializeEditor(bodyRef.current) : body);
             }
           }}
           data-testid="editor-rich-content"
         />
+        {handwritingOpen && (
+          <Suspense fallback={<p className="mt-5 text-xs text-[#777168]">Opening handwriting canvas…</p>}>
+            <HandwritingCanvas
+              initialPages={props.note.handwriting}
+              onChange={saveHandwriting}
+            />
+          </Suspense>
+        )}
         <input ref={fileRef} type="file" accept="image/*" onChange={insertImage} className="hidden" data-testid="input-image-file" />
         {props.saveMessage && <p className="mt-5 text-sm text-[#c39380]" data-testid="status-editor-message">{props.saveMessage}</p>}
-        {props.saveState === 'error' && <button onClick={() => flushSave(title, bodyRef.current?.innerHTML ?? body)} className="mt-4 text-xs text-[#c3aa82] underline underline-offset-4" data-testid="button-retry-note-save">Retry saving this page</button>}
+        {props.saveState === 'error' && <button onClick={() => void saveAndFlushBackup(title, bodyRef.current?.innerHTML ?? body)} className="mt-4 text-xs text-[#c3aa82] underline underline-offset-4" data-testid="button-retry-note-save">Retry saving this page</button>}
       </div>
     </section>
   );
@@ -1705,6 +2108,10 @@ type DataBackupProps = {
   preview: BackupPreview | null;
   strategy: ImportStrategy;
   status: BackupStatus | null;
+  automaticBackupFolder: BackupFolder | null;
+  automaticBackupStatus: AutomaticBackupStatus | null;
+  automaticBackupAvailable: boolean;
+  onSelectAutomaticBackupFolder: () => void;
   onExport: () => void;
   onSelectFile: (file?: File) => void;
   onStrategyChange: (strategy: ImportStrategy) => void;
@@ -1865,6 +2272,34 @@ function SettingsScreen(props: {
           <p className="mb-3 text-[10px] uppercase tracking-[.22em] text-[#6b665d]">Take it with you</p>
           <h2 id="heading-data-backup" className="m-0 font-serif text-3xl font-normal tracking-[-.03em] text-[#e1dbcf]">Data &amp; Backup</h2>
           <p className="mt-3 max-w-lg font-serif text-base leading-relaxed text-[#777168]">Export a local copy of your notes and preferences, or restore them from a backup file. Nothing is uploaded.</p>
+          {props.dataBackup.automaticBackupAvailable && (
+            <div className="mt-7 rounded-xl border border-[#302d26] bg-[#0a0a09] p-5" data-testid="section-automatic-backup">
+              <h3 className="m-0 text-sm font-medium text-[#d5cec2]">Offline rolling backup</h3>
+              <p className="mb-0 mt-2 text-xs leading-relaxed text-[#777168]">
+                {props.dataBackup.automaticBackupFolder
+                  ? `Folder: ${props.dataBackup.automaticBackupFolder.name}/quiet-notes-backup.json`
+                  : 'Not configured — choose a folder on this phone.'}
+              </p>
+              <p
+                role={props.dataBackup.automaticBackupStatus?.kind === 'error' ? 'alert' : 'status'}
+                className={`mb-0 mt-2 text-xs leading-relaxed ${props.dataBackup.automaticBackupStatus?.kind === 'error' ? 'text-[#d4a18f]' : 'text-[#938a78]'}`}
+                data-testid="status-automatic-backup"
+              >
+                {props.dataBackup.automaticBackupStatus?.message ?? 'Backup is not configured.'}
+              </p>
+              <button
+                type="button"
+                onClick={props.dataBackup.onSelectAutomaticBackupFolder}
+                className="control-focus mt-4 min-h-10 rounded-full border border-[#3a362d] px-4 text-xs text-[#d8cfbe] transition hover:border-[#6a604c] hover:bg-[#161511]"
+                data-testid="button-select-automatic-backup-folder"
+              >
+                {props.dataBackup.automaticBackupFolder ? 'Change backup folder' : 'Choose backup folder'}
+              </button>
+              <p className="mb-0 mt-3 text-[11px] leading-relaxed text-[#5e5a53]">
+                Updates are written after saved changes while the app is active. This can protect against many app-data failures, but changes after the last successful backup may be lost; it cannot protect against loss or physical destruction of this phone.
+              </p>
+            </div>
+          )}
           <div className="mt-7 flex flex-col gap-3 sm:flex-row">
             <button
               type="button"

@@ -1,5 +1,11 @@
 import { planBackupImport, type ImportStrategy } from './lib/backup.ts';
 import { noteFlagSaveCoordinator, noteWriteQueue, type NoteFlagValues } from './lib/note-actions.ts';
+import {
+  restoreLibraryDocument,
+  type LibraryDocument,
+  type LibraryDocumentBackup,
+} from './lib/reading-library.ts';
+import type { HandwritingPage } from './lib/handwriting.ts';
 
 export type NoteKind = 'note' | 'task' | 'journal' | 'checklist';
 
@@ -13,6 +19,7 @@ export type QuietNote = {
   recentlyOpenedAt: number;
   pinned?: boolean;
   favorite?: boolean;
+  handwriting?: HandwritingPage[];
   dueDate?: string;
   reminderAt?: number;
   reminderTimezone?: string;
@@ -29,12 +36,30 @@ export type BackupImportResult = {
   skippedCount: number;
   duplicateIds: string[];
   settingsImported: boolean;
+  readingDocumentsImportedCount: number;
 };
 
 const DB_NAME = 'quiet-notes-local';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const NOTES_STORE = 'notes';
 const SETTINGS_STORE = 'settings';
+const DOCUMENTS_STORE = 'reading-library';
+const readingDocumentWrites = new Map<string, Promise<void>>();
+
+function notifyLocalDataChanged(): void {
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('quiet-notes-data-changed'));
+}
+
+function queueReadingDocumentWrite<T>(id: string, write: () => Promise<T>): Promise<T> {
+  const previous = readingDocumentWrites.get(id) ?? Promise.resolve();
+  const operation = previous.catch(() => undefined).then(write);
+  const queued = operation.then(() => undefined, () => undefined);
+  readingDocumentWrites.set(id, queued);
+  void queued.then(() => {
+    if (readingDocumentWrites.get(id) === queued) readingDocumentWrites.delete(id);
+  });
+  return operation;
+}
 
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -50,6 +75,9 @@ function openDatabase(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(SETTINGS_STORE)) {
         db.createObjectStore(SETTINGS_STORE, { keyPath: 'key' });
+      }
+      if (!db.objectStoreNames.contains(DOCUMENTS_STORE)) {
+        db.createObjectStore(DOCUMENTS_STORE, { keyPath: 'id' });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -86,6 +114,22 @@ async function withStore<T>(
 
 export const quietStorage = {
   listNotes: () => withStore<QuietNote[]>('notes', 'readonly', store => store.getAll()),
+  listReadingDocuments: () => withStore<LibraryDocument[]>(DOCUMENTS_STORE, 'readonly', store => store.getAll()),
+  saveReadingDocument(document: LibraryDocument) {
+    return queueReadingDocumentWrite(document.id, () =>
+      withStore<IDBValidKey>(DOCUMENTS_STORE, 'readwrite', store => store.put(document)))
+      .then(key => {
+        notifyLocalDataChanged();
+        return key;
+      });
+  },
+  deleteReadingDocument(id: string) {
+    return queueReadingDocumentWrite(id, () =>
+      withStore<undefined>(DOCUMENTS_STORE, 'readwrite', store => store.delete(id)))
+      .then(() => {
+        notifyLocalDataChanged();
+      });
+  },
   getNote: (id: string) => withStore<QuietNote | undefined>('notes', 'readonly', store => store.get(id)),
   saveNote(note: QuietNote) {
     return noteWriteQueue.run(note.id, async () => {
@@ -98,7 +142,10 @@ export const quietStorage = {
           let failure: Error | undefined;
           transaction.oncomplete = () => {
             if (failure) reject(failure);
-            else if (savedKey !== undefined) resolve(savedKey);
+            else if (savedKey !== undefined) {
+              notifyLocalDataChanged();
+              resolve(savedKey);
+            }
             else reject(new Error('The note save finished without a result.'));
           };
           transaction.onerror = () => reject(transaction.error ?? new Error('The note could not be saved.'));
@@ -140,7 +187,10 @@ export const quietStorage = {
           let failure: Error | undefined;
           transaction.oncomplete = () => {
             if (failure) reject(failure);
-            else if (savedNote) resolve(savedNote);
+            else if (savedNote) {
+              notifyLocalDataChanged();
+              resolve(savedNote);
+            }
             else reject(new Error('The note flag save finished without a result.'));
           };
           transaction.onerror = () => reject(transaction.error ?? new Error('The note flags could not be saved.'));
@@ -176,7 +226,10 @@ export const quietStorage = {
     });
   },
   deleteNote(id: string) {
-    return noteWriteQueue.run(id, () => withStore<undefined>('notes', 'readwrite', store => store.delete(id)));
+    return noteWriteQueue.run(id, async () => {
+      await withStore<undefined>('notes', 'readwrite', store => store.delete(id));
+      notifyLocalDataChanged();
+    });
   },
   async getSettings(): Promise<QuietSettings | undefined> {
     const saved = await withStore<{ key: string; value: QuietSettings } | undefined>(
@@ -185,7 +238,24 @@ export const quietStorage = {
     return saved?.value;
   },
   saveSettings(settings: QuietSettings) {
-    return withStore<IDBValidKey>(SETTINGS_STORE, 'readwrite', store => store.put({ key: 'preferences', value: settings }));
+    return withStore<IDBValidKey>(SETTINGS_STORE, 'readwrite', store => store.put({ key: 'preferences', value: settings }))
+      .then(key => {
+        notifyLocalDataChanged();
+        return key;
+      });
+  },
+  async getBackupStatus(): Promise<string | undefined> {
+    const saved = await withStore<{ key: string; value: string } | undefined>(
+      SETTINGS_STORE, 'readonly', store => store.get('automatic-backup-status'),
+    );
+    return saved?.value;
+  },
+  saveBackupStatus(value: string) {
+    return withStore<IDBValidKey>(
+      SETTINGS_STORE,
+      'readwrite',
+      store => store.put({ key: 'automatic-backup-status', value }),
+    );
   },
   async getSyncBase(uid: string, noteId: string): Promise<number | undefined> {
     const saved = await withStore<{ key: string; value: number } | undefined>(
@@ -232,7 +302,7 @@ export const quietStorage = {
     return noteWriteQueue.run(note.id, async () => {
       const db = await openDatabase();
       try {
-        return await new Promise<boolean>((resolve, reject) => {
+        const applied = await new Promise<boolean>((resolve, reject) => {
           const transaction = db.transaction(NOTES_STORE, 'readwrite');
           const store = transaction.objectStore(NOTES_STORE);
           let applied = false;
@@ -260,6 +330,8 @@ export const quietStorage = {
             applied = true;
           };
         });
+        if (applied) notifyLocalDataChanged();
+        return applied;
       } finally {
         db.close();
       }
@@ -269,13 +341,15 @@ export const quietStorage = {
     notes: QuietNote[],
     settings: QuietSettings,
     strategy: ImportStrategy,
+    library: LibraryDocumentBackup[] = [],
   ): Promise<BackupImportResult> {
     const db = await openDatabase();
     try {
-      return await new Promise<BackupImportResult>((resolve, reject) => {
-        const transaction = db.transaction([NOTES_STORE, SETTINGS_STORE], 'readwrite');
+      const result = await new Promise<BackupImportResult>((resolve, reject) => {
+        const transaction = db.transaction([NOTES_STORE, SETTINGS_STORE, DOCUMENTS_STORE], 'readwrite');
         const noteStore = transaction.objectStore(NOTES_STORE);
         const settingsStore = transaction.objectStore(SETTINGS_STORE);
+        const documentStore = transaction.objectStore(DOCUMENTS_STORE);
         let result: BackupImportResult | undefined;
         let failure: Error | undefined;
 
@@ -286,12 +360,12 @@ export const quietStorage = {
         transaction.onerror = () => reject(transaction.error ?? new Error('The backup could not be imported.'));
         transaction.onabort = () => reject(failure ?? transaction.error ?? new Error('The backup import was interrupted.'));
 
-        const keysRequest = noteStore.getAllKeys();
-        keysRequest.onerror = () => {
-          failure = keysRequest.error ?? new Error('Existing notes could not be checked.');
-        };
-        keysRequest.onsuccess = () => {
-          const existingIds = keysRequest.result.map(String);
+        let existingNoteIds: string[] | undefined;
+        let existingDocumentIds: string[] | undefined;
+        const initializeImport = () => {
+          if (!existingNoteIds || !existingDocumentIds) return;
+          const existingIds = existingNoteIds;
+          const existingDocuments = new Set(existingDocumentIds);
           const plan = planBackupImport(notes, existingIds, strategy);
           if (strategy === 'skip-backup-on-conflict' && plan.duplicateIds.length > 0) {
             result = {
@@ -299,17 +373,22 @@ export const quietStorage = {
               skippedCount: notes.length,
               duplicateIds: plan.duplicateIds,
               settingsImported: false,
+              readingDocumentsImportedCount: 0,
             };
             return;
           }
 
-          let index = 0;
-          const addNextNote = () => {
-            if (index < plan.notesToImport.length) {
-              const request = noteStore.add(plan.notesToImport[index++]);
-              request.onsuccess = addNextNote;
+          const documentsToImport = library
+            .filter(document => !existingDocuments.has(document.id))
+            .map(restoreLibraryDocument);
+          let noteIndex = 0;
+          let documentIndex = 0;
+          const addNextDocument = () => {
+            if (documentIndex < documentsToImport.length) {
+              const request = documentStore.add(documentsToImport[documentIndex++]);
+              request.onsuccess = addNextDocument;
               request.onerror = () => {
-                failure = request.error ?? new Error('A note from the backup could not be added.');
+                failure = request.error ?? new Error('Reading-library details from the backup could not be added.');
               };
               return;
             }
@@ -319,7 +398,19 @@ export const quietStorage = {
               skippedCount: plan.skippedCount,
               duplicateIds: plan.duplicateIds,
               settingsImported: true,
+              readingDocumentsImportedCount: documentsToImport.length,
             };
+          };
+          const addNextNote = () => {
+            if (noteIndex < plan.notesToImport.length) {
+              const request = noteStore.add(plan.notesToImport[noteIndex++]);
+              request.onsuccess = addNextNote;
+              request.onerror = () => {
+                failure = request.error ?? new Error('A note from the backup could not be added.');
+              };
+              return;
+            }
+            addNextDocument();
           };
           try {
             addNextNote();
@@ -328,7 +419,25 @@ export const quietStorage = {
             transaction.abort();
           }
         };
+        const noteKeysRequest = noteStore.getAllKeys();
+        noteKeysRequest.onerror = () => {
+          failure = noteKeysRequest.error ?? new Error('Existing notes could not be checked.');
+        };
+        noteKeysRequest.onsuccess = () => {
+          existingNoteIds = noteKeysRequest.result.map(String);
+          initializeImport();
+        };
+        const documentKeysRequest = documentStore.getAllKeys();
+        documentKeysRequest.onerror = () => {
+          failure = documentKeysRequest.error ?? new Error('Existing reading-library entries could not be checked.');
+        };
+        documentKeysRequest.onsuccess = () => {
+          existingDocumentIds = documentKeysRequest.result.map(String);
+          initializeImport();
+        };
       });
+      if (result.importedCount > 0 || result.settingsImported) notifyLocalDataChanged();
+      return result;
     } finally {
       db.close();
     }
