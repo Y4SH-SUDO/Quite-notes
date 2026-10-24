@@ -4,16 +4,52 @@ Quiet Notes is a local-first notes app. The React/Vite app keeps notes in Indexe
 
 ## Run the web app locally
 
-On Windows, from PowerShell at the repository root:
+### Requirements
+
+- [Node.js](https://nodejs.org/) 20.19+ or 22.12+
+- [pnpm](https://pnpm.io/installation)
+- Git, if you plan to clone the repository
+
+### Download the repository
+
+To clone it, copy the repository's HTTPS or SSH URL from its GitHub **Code** button, then run:
+
+```sh
+git clone <repository-url>
+cd <repository-folder>
+```
+
+Alternatively, use **Code → Download ZIP** on GitHub, extract the ZIP, and open a terminal in the extracted repository folder. In either case, run the following commands from the folder containing this README and the root `pnpm-workspace.yaml`. If you opened a parent folder and the project is inside a `Quite-notes` subfolder, enter that folder first:
 
 ```powershell
-pnpm install --ignore-scripts
+cd .\Quite-notes
+```
+
+### Install dependencies
+
+Run this once after downloading the repository:
+
+```sh
+pnpm install --frozen-lockfile --ignore-scripts
+```
+
+### Start the development server
+
+On Windows, open PowerShell in the repository folder and run:
+
+```powershell
 $env:PORT = "5173"
 $env:BASE_PATH = "/"
 pnpm.cmd --dir artifacts/quiet-notes dev
 ```
 
-Open `http://localhost:5173` in your browser. The Windows native dependencies used by Vite are included by the workspace install; do not add them as direct dependencies.
+On macOS or Linux, run:
+
+```sh
+PORT=5173 BASE_PATH=/ pnpm --dir artifacts/quiet-notes dev
+```
+
+Leave the terminal running and open [http://localhost:5173](http://localhost:5173) in your browser. Press `Ctrl+C` in the terminal to stop the server. If port 5173 is already in use, choose another port and use it for both `PORT` and the browser URL. The Windows native dependencies used by Vite are included by the workspace install; do not add them as direct dependencies.
 
 ## Firebase setup for cloud sync
 
