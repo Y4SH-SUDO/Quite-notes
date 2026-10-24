@@ -2,6 +2,19 @@
 
 Quiet Notes is a local-first notes app. The React/Vite app keeps notes in IndexedDB, supports JSON export/import, and can be packaged for Android with Capacitor.
 
+## Run the web app locally
+
+On Windows, from PowerShell at the repository root:
+
+```powershell
+pnpm install --ignore-scripts
+$env:PORT = "5173"
+$env:BASE_PATH = "/"
+pnpm.cmd --dir artifacts/quiet-notes dev
+```
+
+Open `http://localhost:5173` in your browser. The Windows native dependencies used by Vite are included by the workspace install; do not add them as direct dependencies.
+
 ## Firebase setup for cloud sync
 
 Cloud sync is opt-in and requires a Firebase project. The app does not contain service-account credentials. Its Firebase web configuration is public client configuration; access control is enforced by Firebase Authentication and the rules in `firestore.rules` and `storage.rules`.
